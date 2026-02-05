@@ -1,0 +1,67 @@
+# V2X-VLM 云服务器训练配置 (NPU/GPU)
+# 适用于 Linux 云服务器环境
+
+# 模型配置 (Section 4)
+model:
+  student_model: "microsoft/Florence-2-base"
+  teacher_model: "microsoft/Florence-2-large"
+  trajectory_length: 45
+  hidden_dim: 768
+  teacher_hidden_dim: 1024
+  projection_dim: 256
+  temperature: 0.07
+  kd_temperature: 2.0
+  use_kd: true
+  use_contrastive: true
+
+# 训练配置 (Section 5)
+training:
+  batch_size: 4             # NPU/GPU 可适当增大
+  learning_rate: 1.0e-6
+  weight_decay: 0.01
+  epochs: 10
+  warmup_steps: 100
+  scheduler: "linear"
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true             # NPU 上设为 false
+
+# 损失函数配置 (论文 Eq.14)
+loss:
+  lambda_align: 0.1
+  lambda_kd: 0.5
+  contrastive_temperature: 0.07
+  kd_temperature: 2.0
+  use_contrastive: true
+  use_kd: true
+
+# 数据配置
+data:
+  root: "../data"           # 云服务器数据路径
+  image_size: [768, 768]
+  trajectory_horizon: 45
+  fps: 10
+  
+  # Linux 云服务器: 可使用多进程
+  num_workers: 4
+  pin_memory: true
+  
+  train_ratio: 0.8
+  val_ratio: 0.2
+
+# 检查点配置
+checkpoint:
+  save_dir: "checkpoints"
+  save_every: 1
+  keep_last: 3
+
+# 日志配置
+logging:
+  log_dir: "logs"
+  log_every: 10
+  use_tensorboard: true
+
+# 评估配置
+evaluation:
+  time_horizons: [2.5, 3.5, 4.5]
+  frame_indices: [25, 35, 45]

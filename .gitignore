@@ -1,0 +1,93 @@
+# V2X-VLM 复现项目 .gitignore
+
+# ==================== 大文件/数据 ====================
+# 数据集 (几十GB)
+data/
+
+# 预训练模型
+pretrained_models/
+v2x_vlm_reproduce/pretrained_models/
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# numpy 数据文件
+*.npy
+*.npz
+
+# 输出文件
+outputs/
+v2x_vlm_reproduce/outputs/
+checkpoints/
+logs/
+*.log
+
+# ==================== PDF 文件 ====================
+*.pdf
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ==================== IDE ====================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ==================== Jupyter ====================
+.ipynb_checkpoints/
+*.ipynb
+
+# ==================== OS ====================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==================== 临时文件 ====================
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# ==================== HuggingFace ====================
+.cache/
+hub/
+
+# ==================== 论文图片 ====================
+V2X-VLM_*/_page_*.jpeg

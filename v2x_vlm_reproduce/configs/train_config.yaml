@@ -1,0 +1,97 @@
+# V2X-VLM 训练配置
+# 严格按照论文 Section 5 设置
+
+# 模型配置 (Section 4)
+model:
+  # VLM Backbone
+  student_model: "microsoft/Florence-2-base"    # Student: 可训练
+  teacher_model: "microsoft/Florence-2-large"   # Teacher: 冻结
+  
+  # 轨迹预测 (10Hz × 4.5s = 45 timesteps)
+  trajectory_length: 45
+  
+  # 特征维度
+  hidden_dim: 768           # Florence-2-base hidden dim
+  teacher_hidden_dim: 1024  # Florence-2-large hidden dim
+  projection_dim: 256       # 对比学习投影维度
+  
+  # 温度参数
+  temperature: 0.07         # κ: 对比学习温度 (论文 Section 4.3)
+  kd_temperature: 2.0       # T: 知识蒸馏温度 (论文 Eq.13)
+  
+  # 模块开关
+  use_kd: true              # 使用知识蒸馏
+  use_contrastive: true     # 使用对比对齐
+
+# 训练配置 (Section 5)
+training:
+  # 基础参数 (论文明确指定)
+  batch_size: 4
+  learning_rate: 1.0e-6     # 论文: 1e-6
+  weight_decay: 0.01
+  epochs: 10
+  
+  # 学习率调度
+  warmup_steps: 100
+  scheduler: "linear"       # 线性衰减
+  
+  # 梯度
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  
+  # 混合精度
+  use_amp: true             # 自动混合精度
+
+# 损失函数配置 (论文 Eq.14)
+# L_total = L_traj + λ₁ × L_align + λ₂ × L_KD
+loss:
+  lambda_align: 0.1         # λ₁: 对比对齐权重 (论文 Table 1)
+  lambda_kd: 0.5            # λ₂: 知识蒸馏权重 (论文 Table 1)
+  contrastive_temperature: 0.07  # κ (论文 Section 4.3)
+  kd_temperature: 2.0       # T (论文 Eq.13)
+  use_contrastive: true
+  use_kd: true
+
+# 数据配置
+data:
+  # 数据根目录 (需要修改为实际路径)
+  root: "../data"
+  
+  # 图像设置
+  image_size: [768, 768]    # Florence-2 输入尺寸
+  
+  # 轨迹设置
+  trajectory_horizon: 45    # 4.5秒 @ 10Hz
+  fps: 10
+  
+  # 数据加载 (根据环境调整)
+  # Windows本地: num_workers=0
+  # Linux云服务器: num_workers=4
+  num_workers: 0
+  pin_memory: false
+  
+  # 数据集划分
+  train_ratio: 0.8
+  val_ratio: 0.2
+
+# 检查点配置
+checkpoint:
+  save_dir: "checkpoints"
+  save_every: 1             # 每epoch保存
+  keep_last: 3              # 保留最近3个
+
+# 日志配置
+logging:
+  log_dir: "logs"
+  log_every: 10
+  use_tensorboard: true
+
+# 评估配置
+evaluation:
+  eval_times: [2.5, 3.5, 4.5]  # 评估时间点(秒)
+  collision_threshold: 2.0      # 碰撞判定距离(米)
+evaluation:
+  # 评估时间点 (秒)
+  time_horizons: [2.5, 3.5, 4.5]
+  # 对应帧索引 (10Hz)
+  frame_indices: [25, 35, 45]

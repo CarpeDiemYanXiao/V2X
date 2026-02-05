@@ -1,0 +1,43 @@
+# configs/config.yaml
+
+# ======================
+# 数据配置
+# ======================
+data_root: /root/autodl-tmp/v2x_vlm/data   
+img_h: 1080
+img_w: 1920
+
+batch_size: 2
+num_workers: 4
+
+# ======================
+# 训练配置
+# ======================
+device: cuda               # auto / cuda / cpu
+epochs: 10
+lr: 5e-5
+weight_decay: 0.01
+grad_clip: 0.1
+save_interval: 2          # 每N个epoch保存一次
+future_steps: 45
+
+# ======================
+# 模型配置
+# ======================
+student_model_path: /root/autodl-tmp/models/florence2/Florence-2-base
+teacher_model_path: /root/autodl-tmp/models/florence2/Florence-2-large
+output_dir: ./outputs
+
+# 模型架构参数（需要与StudentV2XVLM中的配置匹配）
+model:
+  hidden_dim: 768           # Florence-2-base的隐藏层维度
+  proj_dim: 256            # 对比学习投影维度
+  pred_steps: 45           # 预测未来时间步数
+  vocab_size: 1024
+  min_coord: -250.0
+  max_coord: 250.0
+# ======================
+# 损失权重（论文第5.2节）
+# ======================
+lambda_align: 0.1          # 对比损失权重
+lambda_kd: 0.5            # 蒸馏损失权重
