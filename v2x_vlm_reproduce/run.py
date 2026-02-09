@@ -2,6 +2,8 @@
 """
 V2X-VLM 快速启动脚本
 
+支持设备: CUDA / NPU (华为昇腾) / CPU
+
 一键执行完整复现流程:
 1. 数据预处理 (生成GT轨迹)
 2. 生成场景描述
@@ -40,6 +42,19 @@ def main():
         type=str,
         required=True,
         help='数据集根目录路径 (包含cooperative-vehicle-infrastructure/)'
+    )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='auto',
+        choices=['auto', 'cuda', 'npu', 'cpu'],
+        help='训练设备: auto(自动检测) | cuda | npu | cpu'
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=None,
+        help='使用指定的配置文件 (优先级高于自动生成)'
     )
     parser.add_argument(
         '--output_dir',
@@ -115,8 +130,20 @@ def main():
     config_path = output_dir / 'temp_config.yaml'
     config_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # 根据设备设置 num_workers
+    if args.device == 'npu' or args.device == 'cpu':
+        num_workers = 0
+        pin_memory = 'false'
+    else:
+        num_workers = 4
+        pin_memory = 'false'  # Windows 建议关闭
+    
     config_content = f"""
 # V2X-VLM 训练配置 (自动生成)
+
+device:
+  type: "{args.device}"
+
 model:
   student_model: "microsoft/Florence-2-base"
   teacher_model: "microsoft/Florence-2-large"
@@ -134,7 +161,8 @@ data:
   image_size: [768, 768]
   trajectory_horizon: 45
   train_ratio: 0.8
-  num_workers: 4
+  num_workers: {num_workers}
+  pin_memory: {pin_memory}
 
 training:
   batch_size: {args.batch_size}

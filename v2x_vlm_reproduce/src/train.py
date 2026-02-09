@@ -24,8 +24,20 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
-from torch.amp import GradScaler, autocast
 from tqdm import tqdm
+
+# 混合精度支持 (兼容不同PyTorch版本)
+try:
+    from torch.amp import GradScaler, autocast
+    AMP_AVAILABLE = True
+except ImportError:
+    try:
+        from torch.cuda.amp import GradScaler, autocast
+        AMP_AVAILABLE = True
+    except ImportError:
+        AMP_AVAILABLE = False
+        GradScaler = None
+        autocast = None
 
 # 添加项目路径
 sys.path.append(str(Path(__file__).parent.parent))
@@ -73,6 +85,8 @@ class Trainer:
     """
     V2X-VLM 训练器
     
+    支持设备: CUDA / NPU (华为昇腾) / CPU
+    
     实现完整的训练流程:
     1. 数据加载
     2. 模型前向传播
@@ -89,20 +103,29 @@ class Trainer:
     ):
         self.config = config
         
-        # 自动检测设备: NPU > CUDA > CPU
-        if device == "auto":
-            self.device = self._detect_device()
-        else:
-            self.device = device
-        
-        # 创建输出目录
+        # 创建输出目录 (需要在日志之前)
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # 设置日志
         self.logger = setup_logging(str(self.output_dir))
-        self.logger.info(f"Config: {config}")
+        
+        # 设备配置: 优先使用配置文件中的设置
+        device_config = config.get('device', {})
+        config_device = device_config.get('type', 'auto')
+        
+        if device != "auto":
+            # 命令行参数优先级最高
+            self.device = device
+        elif config_device != "auto":
+            # 其次是配置文件
+            self.device = config_device
+        else:
+            # 最后自动检测
+            self.device = self._detect_device()
+        
+        self.logger.info(f"Config loaded")
         self.logger.info(f"Device: {self.device}")
         
         # 初始化模型
@@ -114,9 +137,8 @@ class Trainer:
         # 初始化优化器和调度器
         self._init_optimizer()
         
-        # 混合精度训练 (仅 CUDA 支持)
-        self.use_amp = config.get('training', {}).get('use_amp', True) and 'cuda' in self.device
-        self.scaler = GradScaler('cuda') if self.use_amp else None
+        # 混合精度训练设置 (支持 CUDA 和 NPU)
+        self._setup_amp()
         
         # 训练状态
         self.current_epoch = 0
@@ -129,15 +151,85 @@ class Trainer:
         try:
             import torch_npu
             if torch.npu.is_available():
-                return "npu"
+                npu_count = torch.npu.device_count()
+                self.logger.info(f"Detected {npu_count} NPU device(s)")
+                return "npu:0"
         except ImportError:
             pass
+        except Exception as e:
+            self.logger.warning(f"NPU detection failed: {e}")
         
         # 尝试 CUDA
         if torch.cuda.is_available():
-            return "cuda"
+            cuda_count = torch.cuda.device_count()
+            self.logger.info(f"Detected {cuda_count} CUDA device(s)")
+            self.logger.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+            return "cuda:0"
         
+        self.logger.warning("No GPU detected, using CPU")
         return "cpu"
+    
+    def _get_device_type(self) -> str:
+        """获取设备类型 (不含设备编号)"""
+        if 'npu' in self.device:
+            return 'npu'
+        elif 'cuda' in self.device:
+            return 'cuda'
+        return 'cpu'
+    
+    def _setup_amp(self):
+        """设置混合精度训练"""
+        train_config = self.config.get('training', {})
+        use_amp_config = train_config.get('use_amp', True)
+        device_type = self._get_device_type()
+        
+        # 检查是否支持混合精度
+        if not AMP_AVAILABLE:
+            self.logger.warning("AMP not available in this PyTorch version")
+            self.use_amp = False
+            self.scaler = None
+            self.amp_dtype = torch.float32
+            return
+        
+        if device_type == 'cpu':
+            self.logger.info("AMP disabled for CPU")
+            self.use_amp = False
+            self.scaler = None
+            self.amp_dtype = torch.float32
+            return
+        
+        if device_type == 'npu':
+            # NPU 混合精度设置
+            try:
+                import torch_npu
+                self.use_amp = use_amp_config
+                if self.use_amp:
+                    self.scaler = GradScaler('npu') if hasattr(GradScaler, '__init__') else GradScaler()
+                    self.amp_dtype = torch.float16
+                    self.logger.info("NPU AMP enabled with float16")
+                else:
+                    self.scaler = None
+                    self.amp_dtype = torch.float32
+            except Exception as e:
+                self.logger.warning(f"NPU AMP setup failed: {e}, disabling AMP")
+                self.use_amp = False
+                self.scaler = None
+                self.amp_dtype = torch.float32
+            return
+        
+        # CUDA 混合精度设置
+        self.use_amp = use_amp_config
+        if self.use_amp:
+            try:
+                self.scaler = GradScaler('cuda')
+            except TypeError:
+                # 旧版本 PyTorch
+                self.scaler = GradScaler()
+            self.amp_dtype = torch.float16
+            self.logger.info("CUDA AMP enabled with float16")
+        else:
+            self.scaler = None
+            self.amp_dtype = torch.float32
     
     def _init_model(self):
         """初始化模型"""
@@ -275,7 +367,8 @@ class Trainer:
             
             # 前向传播 (混合精度)
             if self.use_amp:
-                with autocast('cuda'):
+                device_type = self._get_device_type()
+                with autocast(device_type, dtype=self.amp_dtype):
                     outputs = self.model(
                         pixel_values=pixel_values,
                         input_ids=input_ids,

@@ -2,15 +2,19 @@
 
 基于 "V2X-VLM: End-to-End V2X cooperative autonomous driving through large vision-Language models" 论文的完整复现实现。
 
+**支持设备**: CUDA / NPU (华为昇腾) / CPU
+
 ## 目录结构
 
 ```
 v2x_vlm_reproduce/
 ├── configs/
-│   └── train_config.yaml      # 训练配置
+│   ├── train_config.yaml      # 通用训练配置
+│   └── train_config_npu.yaml  # NPU云服务器配置
 ├── scripts/
 │   ├── generate_trajectory_gt.py    # GT轨迹生成
 │   ├── generate_scene_descriptions.py  # 场景描述生成
+│   ├── test_model.py          # 模型测试脚本
 │   └── verify_data.py         # 数据验证
 ├── src/
 │   ├── data/
@@ -43,12 +47,22 @@ v2x_vlm_reproduce/
 ```bash
 cd v2x_vlm_reproduce
 pip install -r requirements.txt
+
+# NPU环境额外安装 (华为昇腾)
+# pip install torch_npu
 ```
 
 ### 2. 一键运行 (推荐)
 
 ```bash
-python run.py --data_root /path/to/dair-v2x/data --epochs 10
+# CUDA (自动检测)
+python run.py --data_root ../data --epochs 10
+
+# 指定 NPU
+python run.py --data_root ../data --device npu --epochs 10
+
+# 使用指定配置文件
+python run.py --data_root ../data --config configs/train_config_npu.yaml
 ```
 
 ### 3. 手动分步执行
@@ -69,7 +83,11 @@ python scripts/generate_scene_descriptions.py --data_root ../data
 #### 3.2 训练
 
 ```bash
+# 通用配置 (CUDA)
 python src/train.py --config configs/train_config.yaml --output_dir outputs
+
+# NPU 配置
+python src/train.py --config configs/train_config_npu.yaml --output_dir outputs
 ```
 
 #### 3.3 评估
@@ -79,6 +97,14 @@ python src/evaluate.py --config configs/train_config.yaml \
     --checkpoint outputs/checkpoints/best_model.pt \
     --visualize
 ```
+
+## 设备支持
+
+| 设备 | 配置文件 | 备注 |
+|------|---------|------|
+| CUDA | `train_config.yaml` | 推荐，支持混合精度 |
+| NPU | `train_config_npu.yaml` | 华为昇腾，需安装 torch_npu |
+| CPU | `train_config.yaml` + `device: cpu` | 不推荐，速度慢 |
 
 ## 论文核心方法
 

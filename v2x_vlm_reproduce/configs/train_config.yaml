@@ -1,7 +1,21 @@
 # V2X-VLM 训练配置
 # 严格按照论文 Section 5 设置
 
+# ============================================
+# 设备配置 (支持 CUDA / NPU / CPU)
+# ============================================
+device:
+  # 设备选择: "auto" | "cuda" | "cuda:0" | "npu" | "npu:0" | "cpu"
+  # auto: 自动检测 NPU > CUDA > CPU
+  type: "auto"
+  
+  # 多卡训练 (可选)
+  # distributed: false
+  # world_size: 1
+
+# ============================================
 # 模型配置 (Section 4)
+# ============================================
 model:
   # VLM Backbone
   student_model: "microsoft/Florence-2-base"    # Student: 可训练
@@ -23,7 +37,9 @@ model:
   use_kd: true              # 使用知识蒸馏
   use_contrastive: true     # 使用对比对齐
 
+# ============================================
 # 训练配置 (Section 5)
+# ============================================
 training:
   # 基础参数 (论文明确指定)
   batch_size: 4
@@ -39,11 +55,14 @@ training:
   grad_clip: 1.0
   gradient_accumulation_steps: 1
   
-  # 混合精度
+  # 混合精度训练 (CUDA/NPU 均支持)
   use_amp: true             # 自动混合精度
+  amp_dtype: "float16"      # float16 或 bfloat16
 
+# ============================================
 # 损失函数配置 (论文 Eq.14)
 # L_total = L_traj + λ₁ × L_align + λ₂ × L_KD
+# ============================================
 loss:
   lambda_align: 0.1         # λ₁: 对比对齐权重 (论文 Table 1)
   lambda_kd: 0.5            # λ₂: 知识蒸馏权重 (论文 Table 1)
@@ -52,9 +71,11 @@ loss:
   use_contrastive: true
   use_kd: true
 
+# ============================================
 # 数据配置
+# ============================================
 data:
-  # 数据根目录 (需要修改为实际路径)
+  # 数据根目录 (相对于 v2x_vlm_reproduce 目录)
   root: "../data"
   
   # 图像设置
@@ -65,33 +86,38 @@ data:
   fps: 10
   
   # 数据加载 (根据环境调整)
-  # Windows本地: num_workers=0
-  # Linux云服务器: num_workers=4
+  # Windows本地 / NPU: num_workers=0
+  # Linux云服务器 CUDA: num_workers=4
   num_workers: 0
-  pin_memory: false
+  pin_memory: false         # NPU不支持pin_memory
   
   # 数据集划分
   train_ratio: 0.8
   val_ratio: 0.2
 
+# ============================================
 # 检查点配置
+# ============================================
 checkpoint:
   save_dir: "checkpoints"
   save_every: 1             # 每epoch保存
   keep_last: 3              # 保留最近3个
 
+# ============================================
 # 日志配置
+# ============================================
 logging:
   log_dir: "logs"
   log_every: 10
   use_tensorboard: true
 
+# ============================================
 # 评估配置
-evaluation:
-  eval_times: [2.5, 3.5, 4.5]  # 评估时间点(秒)
-  collision_threshold: 2.0      # 碰撞判定距离(米)
+# ============================================
 evaluation:
   # 评估时间点 (秒)
   time_horizons: [2.5, 3.5, 4.5]
   # 对应帧索引 (10Hz)
   frame_indices: [25, 35, 45]
+  # 碰撞判定距离(米)
+  collision_threshold: 2.0

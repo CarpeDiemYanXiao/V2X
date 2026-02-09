@@ -1,0 +1,110 @@
+# V2X-VLM NPU云服务器训练配置
+# 适用于华为昇腾NPU (如 Atlas 800)
+
+# ============================================
+# 设备配置 - NPU专用
+# ============================================
+device:
+  type: "npu:0"             # 使用第一块NPU
+  # type: "auto"            # 或自动检测
+
+# ============================================
+# 模型配置 (与论文一致)
+# ============================================
+model:
+  student_model: "microsoft/Florence-2-base"
+  teacher_model: "microsoft/Florence-2-large"
+  trajectory_length: 45
+  hidden_dim: 768
+  teacher_hidden_dim: 1024
+  projection_dim: 256
+  temperature: 0.07
+  kd_temperature: 2.0
+  use_kd: true
+  use_contrastive: true
+  # NPU模型缓存目录 (可选, 默认 ./pretrained_models)
+  # cache_dir: "/path/to/models"
+
+# ============================================
+# 训练配置 - NPU优化
+# ============================================
+training:
+  # 论文参数
+  batch_size: 4             # 可根据NPU显存调整 (如8/16)
+  learning_rate: 1.0e-6
+  weight_decay: 0.01
+  epochs: 10
+  
+  # 调度器
+  warmup_steps: 100
+  scheduler: "linear"
+  
+  # 梯度
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  
+  # NPU混合精度
+  use_amp: true
+  amp_dtype: "float16"      # NPU推荐使用float16
+
+# ============================================
+# 损失函数配置
+# ============================================
+loss:
+  lambda_align: 0.1
+  lambda_kd: 0.5
+  contrastive_temperature: 0.07
+  kd_temperature: 2.0
+  use_contrastive: true
+  use_kd: true
+
+# ============================================
+# 数据配置 - NPU优化
+# ============================================
+data:
+  root: "../data"           # 相对路径，或云服务器绝对路径
+  image_size: [768, 768]
+  trajectory_horizon: 45
+  fps: 10
+  
+  # NPU数据加载优化
+  # NPU建议: num_workers=4-8, pin_memory=false
+  num_workers: 4            # NPU支持多进程加载
+  pin_memory: false         # NPU不支持pin_memory
+  prefetch_factor: 2        # 预取因子
+  
+  train_ratio: 0.8
+  val_ratio: 0.2
+
+# ============================================
+# 检查点配置
+# ============================================
+checkpoint:
+  save_dir: "checkpoints"
+  save_every: 1
+  keep_last: 3
+
+# ============================================
+# 日志配置
+# ============================================
+logging:
+  log_dir: "logs"
+  log_every: 10
+  use_tensorboard: true
+
+# ============================================
+# 评估配置
+# ============================================
+evaluation:
+  time_horizons: [2.5, 3.5, 4.5]
+  frame_indices: [25, 35, 45]
+  collision_threshold: 2.0
+
+# ============================================
+# NPU特定配置 (可选)
+# ============================================
+npu:
+  # 算子融合优化
+  enable_combined_opt: true
+  # 通信优化 (多卡)
+  # hccl_timeout: 1800
