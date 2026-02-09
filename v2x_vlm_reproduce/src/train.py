@@ -39,8 +39,8 @@ except ImportError:
         GradScaler = None
         autocast = None
 
-# 添加项目路径
-sys.path.append(str(Path(__file__).parent.parent))
+# 添加 src/ 目录到路径 (使 data/, models/, losses/ 等模块可导入)
+sys.path.insert(0, str(Path(__file__).parent))
 
 from data.dataset import V2XVLMDataset, V2XVLMCollator, create_dataloaders
 from models.v2x_vlm import V2XVLM

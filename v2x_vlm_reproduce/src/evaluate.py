@@ -19,7 +19,8 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
-sys.path.append(str(Path(__file__).parent.parent))
+# 添加 src/ 目录到路径
+sys.path.insert(0, str(Path(__file__).parent))
 
 from data.dataset import V2XVLMDataset, V2XVLMCollator
 from models.v2x_vlm import V2XVLM
