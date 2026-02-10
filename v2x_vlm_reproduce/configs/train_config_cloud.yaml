@@ -5,6 +5,8 @@
 model:
   student_model: "microsoft/Florence-2-base"
   teacher_model: "microsoft/Florence-2-large"
+  # 预训练模型缓存目录 (AutoDL 服务器路径)
+  cache_dir: "/root/autodl-tmp/pretrained_models"
   trajectory_length: 45
   hidden_dim: 768
   teacher_hidden_dim: 1024

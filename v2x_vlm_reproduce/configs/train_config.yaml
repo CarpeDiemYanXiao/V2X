@@ -21,6 +21,9 @@ model:
   student_model: "microsoft/Florence-2-base"    # Student: 可训练
   teacher_model: "microsoft/Florence-2-large"   # Teacher: 冻结
   
+  # 预训练模型缓存目录 (AutoDL 服务器路径)
+  cache_dir: "/root/autodl-tmp/pretrained_models"
+  
   # 轨迹预测 (10Hz × 4.5s = 45 timesteps)
   trajectory_length: 45
   
