@@ -102,7 +102,7 @@ data:
 # 检查点配置
 # ============================================
 checkpoint:
-  save_dir: "checkpoints"
+  save_dir: "/root/autodl-tmp/outputs/checkpoints"
   save_every: 1             # 每epoch保存
   keep_last: 3              # 保留最近3个
 
@@ -110,7 +110,7 @@ checkpoint:
 # 日志配置
 # ============================================
 logging:
-  log_dir: "logs"
+  log_dir: "/root/autodl-tmp/outputs/logs"
   log_every: 10
   use_tensorboard: true
 

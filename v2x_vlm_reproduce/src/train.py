@@ -551,8 +551,8 @@ def main():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='./outputs',
-        help='Output directory'
+        default='/root/autodl-tmp/outputs',
+        help='Output directory (建议使用大容量数据盘)'
     )
     parser.add_argument(
         '--resume',
