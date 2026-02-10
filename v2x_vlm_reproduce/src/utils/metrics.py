@@ -54,7 +54,6 @@ def compute_l2_error(
         step = int(t * hz)
         step = min(step, l2_distance.shape[1])
         
-        # 使用累积平均误差
         l2_at_t = l2_distance[:, :step].mean(axis=1).mean()
         metrics[f'l2_{t}s'] = float(l2_at_t)
     
