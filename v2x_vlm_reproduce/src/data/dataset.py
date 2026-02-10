@@ -221,6 +221,18 @@ Current Ego Vehicle Position: x={ego_position[0]:.2f}m, y={ego_position[1]:.2f}m
 Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. Output a sequence of 45 waypoints (x, y) at 10Hz in the ego-centric coordinate system."""
 
         return prompt
+
+    def _trajectory_to_text(self, trajectory: np.ndarray) -> str:
+        """
+        将轨迹格式化为文本标签 (用于token生成训练)
+
+        格式: "x1,y1;x2,y2;...;x45,y45" (2位小数)
+        """
+        points = []
+        for t in range(trajectory.shape[0]):
+            x, y = trajectory[t, 0], trajectory[t, 1]
+            points.append(f"{x:.2f},{y:.2f}")
+        return ";".join(points)
     
     def _load_and_process_images(
         self,
@@ -325,6 +337,9 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
             sample['infra_frame_id'],
             ego_position
         )
+
+        # 构建轨迹文本标签 (decoder labels)
+        trajectory_text = self._trajectory_to_text(trajectory)
         
         # 使用processor处理 (如果提供)
         if self.processor:
@@ -335,12 +350,20 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
             )
             # 移除batch维度
             inputs = {k: v.squeeze(0) if hasattr(v, 'squeeze') else v for k, v in inputs.items()}
+
+            # 轨迹标签 tokenization
+            label_inputs = self.processor.tokenizer(
+                trajectory_text,
+                return_tensors="pt"
+            )
+            trajectory_labels = label_inputs["input_ids"].squeeze(0)
         else:
             # 返回原始数据 (用于调试)
             inputs = {
                 'image': combined_image,
                 'text': text_prompt
             }
+            trajectory_labels = None
         
         # 加载障碍物位置 (用于碰撞率 Collision Rate 计算)
         obstacle_positions = self._load_obstacle_positions(
@@ -353,6 +376,7 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
             'frame_id': sample['vehicle_frame_id'],
             'ego_position': torch.tensor(ego_position[:2], dtype=torch.float32),  # prompt只用xy
             'obstacle_positions': torch.from_numpy(obstacle_positions),  # [N_obs, 2]
+            'trajectory_labels': trajectory_labels,  # [L_traj]
         }
 
 
@@ -396,6 +420,21 @@ class V2XVLMCollator:
         ego_positions = torch.stack([item['ego_position'] for item in batch])
         frame_ids = [item['frame_id'] for item in batch]
 
+        # 动态padding trajectory_labels (使用 -100 作为 ignore_index)
+        trajectory_labels_list = [item['trajectory_labels'] for item in batch]
+        if any(label is None for label in trajectory_labels_list):
+            padded_trajectory_labels = None
+        else:
+            max_label_len = max(lbl.size(0) for lbl in trajectory_labels_list)
+            padded_labels = []
+            for lbl in trajectory_labels_list:
+                pad_len = max_label_len - lbl.size(0)
+                if pad_len > 0:
+                    pad = torch.full((pad_len,), -100, dtype=lbl.dtype)
+                    lbl = torch.cat([lbl, pad])
+                padded_labels.append(lbl)
+            padded_trajectory_labels = torch.stack(padded_labels)
+
         # 处理变长障碍物位置: padding 到批次内最大数量
         obstacle_list = [item['obstacle_positions'] for item in batch]
         max_n_obs = max(obs.size(0) for obs in obstacle_list) if obstacle_list else 0
@@ -419,6 +458,7 @@ class V2XVLMCollator:
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'trajectory_gt': trajectory_gt,
+            'trajectory_labels': padded_trajectory_labels,
             'ego_position': ego_positions,
             'frame_id': frame_ids,
             'obstacle_positions': torch.stack(padded_obstacles),   # [B, max_N_obs, 2]

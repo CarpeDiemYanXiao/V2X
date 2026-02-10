@@ -121,6 +121,12 @@ class V2XVLM(nn.Module):
             local_files_only=True
         )
         
+        # 冻结 student 视觉编码器 (论文 Section 5.2)
+        # "the vision encoder parameters in the student model are kept frozen"
+        print("Freezing student vision encoder (paper Section 5.2)...")
+        for param in self.student_model.vision_tower.parameters():
+            param.requires_grad = False
+        
         # Teacher Model - Florence-2-Large (frozen)
         if use_knowledge_distillation:
             print("Loading Teacher model (Florence-2-Large)...")
@@ -290,85 +296,113 @@ class V2XVLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         trajectory_gt: Optional[torch.Tensor] = None,
+        trajectory_labels: Optional[torch.Tensor] = None,
         return_features: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        前向传播
+        前向传播 — 基于 Token 生成的轨迹预测 (论文 Eq.11)
         
+        论文核心: 轨迹预测 = next-token prediction (cross-entropy loss)
+        而非 MLP 回归 (L1 loss).
+
         Args:
             pixel_values: 拼接的图像 [B, 3, H, 2W]
-            input_ids: 文本token IDs [B, L]
+            input_ids: 文本 token IDs [B, L] (encoder input)
             attention_mask: 注意力掩码 [B, L]
-            trajectory_gt: GT轨迹 [B, T, 2], 用于计算损失
+            trajectory_gt: GT 轨迹 [B, T, 2] (仅 fallback 用)
+            trajectory_labels: 轨迹文本 token IDs [B, L_traj] (decoder target, -100=padding)
             return_features: 是否返回中间特征
             
         Returns:
-            outputs: 包含预测轨迹和各项损失的字典
+            outputs: 包含损失的字典
         """
-        batch_size = pixel_values.shape[0]
         outputs = {}
+        losses = {}
+        student_vision = None
         
-        # ========== Student Forward ==========
-        student_features = self.encode_multimodal(
-            self.student_model,
-            pixel_values,
-            input_ids,
-            attention_mask
-        )
+        # ========== 1. Student Forward: Token 生成 + Cross-Entropy Loss (Eq.11) ==========
+        if trajectory_labels is not None:
+            # 训练模式: teacher forcing, cross-entropy loss
+            student_out = self.student_model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                labels=trajectory_labels,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            losses['loss_traj'] = student_out.loss
+            outputs['student_logits'] = student_out.logits
+        elif trajectory_gt is not None:
+            # Fallback: MLP 轨迹头 (兼容旧模式)
+            student_features = self.encode_multimodal(
+                self.student_model, pixel_values, input_ids, attention_mask
+            )
+            trajectory_pred = self.trajectory_head(
+                student_features['fusion_features'], attention_mask=None
+            )
+            outputs['trajectory_pred'] = trajectory_pred
+            losses['loss_traj'] = F.l1_loss(trajectory_pred, trajectory_gt)
         
-        # 轨迹预测 [Eq.7]
-        # τ = f_traj(F_multi)
-        # 注意: 不传 attention_mask，因为 fusion_features 的序列长度与 input_ids 不同
-        trajectory_pred = self.trajectory_head(
-            student_features['fusion_features'],
-            attention_mask=None  # 使用简单均值池化
-        )
-        outputs['trajectory_pred'] = trajectory_pred  # [B, T, 2]
+        # ========== 2. 提取 Student 视觉特征 (用于对比对齐) ==========
+        if self.use_alignment and self.alignment_module is not None:
+            try:
+                if hasattr(self.student_model, '_encode_image'):
+                    student_vision = self.student_model._encode_image(pixel_values)
+                else:
+                    student_vision = self.student_model.vision_tower(pixel_values)
+                    if isinstance(student_vision, tuple):
+                        student_vision = student_vision[0]
+                    if hasattr(student_vision, 'last_hidden_state'):
+                        student_vision = student_vision.last_hidden_state
+            except Exception as e:
+                print(f"Warning: Vision feature extraction failed: {e}")
+                student_vision = None
         
-        # ========== Teacher Forward (for KD and/or contrastive alignment) ==========
-        need_teacher = (
-            (self.use_kd or self.use_alignment) and self.teacher_model is not None
-        )
+        # ========== 3. Teacher Forward (对比对齐 + KD) ==========
+        teacher_text_emb = None
+        need_teacher = (self.use_kd or self.use_alignment) and self.teacher_model is not None
+        
         if need_teacher:
             with torch.no_grad():
-                teacher_features = self.encode_multimodal(
-                    self.teacher_model,
-                    pixel_values,
-                    input_ids,
-                    attention_mask
-                )
-            outputs['teacher_features'] = teacher_features
+                # Teacher 文本嵌入 (用于对比对齐: student vision vs teacher text)
+                if self.use_alignment:
+                    try:
+                        teacher_encoder = self.teacher_model.language_model.model.encoder
+                        teacher_text_emb = teacher_encoder.embed_tokens(input_ids)
+                    except Exception as e:
+                        print(f"Warning: Teacher text embedding failed: {e}")
+                
+                # Teacher logits (用于知识蒸馏 Eq.13)
+                if self.use_kd and trajectory_labels is not None:
+                    teacher_out = self.teacher_model(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        attention_mask=attention_mask,
+                        labels=trajectory_labels,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    outputs['teacher_logits'] = teacher_out.logits
         
-        # ========== 计算损失 ==========
-        losses = {}
+        # ========== 4. 对比对齐损失 L_align (Eq.12) ==========
+        if (self.use_alignment and self.alignment_module is not None
+                and student_vision is not None and teacher_text_emb is not None):
+            z_v, z_t = self.alignment_module(student_vision, teacher_text_emb)
+            losses['loss_align'] = self.alignment_module.compute_loss(z_v, z_t)
         
-        # 1. 轨迹回归损失 L_traj [Eq.8]
-        if trajectory_gt is not None:
-            loss_traj = F.l1_loss(trajectory_pred, trajectory_gt)
-            losses['loss_traj'] = loss_traj
-        
-        # 2. 对比对齐损失 L_align [Eq.12]
-        #    论文: z_v = g_v(f_v^student(I))  vs  z_t = g_t(f_t^teacher(E))
-        if self.use_alignment and self.alignment_module is not None and 'teacher_features' in outputs:
-            z_v, z_t = self.alignment_module(
-                student_features['vision_features'],              # student 视觉
-                outputs['teacher_features']['text_embeddings']    # teacher 文本
+        # ========== 5. 知识蒸馏损失 L_KD (Eq.13) — 基于 token logits ==========
+        if self.use_kd and 'student_logits' in outputs and 'teacher_logits' in outputs:
+            losses['loss_kd'] = self._compute_kd_loss_logits(
+                outputs['student_logits'],
+                outputs['teacher_logits'],
+                trajectory_labels
             )
-            loss_align = self.alignment_module.compute_loss(z_v, z_t)
-            losses['loss_align'] = loss_align
-        
-        # 3. 知识蒸馏损失 L_KD [Eq.13]
-        if self.use_kd and self.teacher_model is not None and 'teacher_features' in outputs:
-            loss_kd = self.compute_kd_loss(
-                student_features['fusion_features'],
-                outputs['teacher_features']['fusion_features']
-            )
-            losses['loss_kd'] = loss_kd
         
         outputs['losses'] = losses
         
-        if return_features:
-            outputs['student_features'] = student_features
+        if return_features and student_vision is not None:
+            outputs['student_vision_features'] = student_vision
         
         return outputs
     
@@ -420,14 +454,123 @@ class V2XVLM(nn.Module):
         
         return loss_kd
     
-    def predict(
+    def _compute_kd_loss_logits(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        基于 token logits 的知识蒸馏损失 (论文 Eq.13)
+        
+        L_KD = T^2 * KL(softmax(τ_T/T) || softmax(τ_S/T))
+        
+        Args:
+            student_logits: [B, seq_len, vocab_size]
+            teacher_logits: [B, seq_len, vocab_size]
+            labels: [B, seq_len] (-100 表示 padding)
+        """
+        T = self.kd_temperature
+        
+        if labels is not None:
+            # 只在有效 token 位置计算 KD loss
+            valid_mask = (labels != -100)
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=student_logits.device)
+            student_flat = student_logits[valid_mask]  # [N_valid, vocab_size]
+            teacher_flat = teacher_logits[valid_mask]   # [N_valid, vocab_size]
+        else:
+            student_flat = student_logits.reshape(-1, student_logits.size(-1))
+            teacher_flat = teacher_logits.reshape(-1, teacher_logits.size(-1))
+        
+        if student_flat.numel() == 0:
+            return torch.tensor(0.0, device=student_logits.device)
+        
+        student_soft = F.log_softmax(student_flat / T, dim=-1)
+        teacher_soft = F.softmax(teacher_flat / T, dim=-1).detach()
+        
+        loss = F.kl_div(student_soft, teacher_soft, reduction='batchmean') * (T ** 2)
+        return loss
+    
+    @staticmethod
+    def trajectory_to_text(trajectory) -> list:
+        """
+        将轨迹张量转换为文本字符串 (用于 decoder labels)
+        
+        格式: "x1,y1;x2,y2;...;x45,y45" (2位小数)
+        
+        Args:
+            trajectory: [B, T, 2] tensor/ndarray 或 [T, 2]
+        Returns:
+            texts: list of str
+        """
+        import numpy as np
+        if isinstance(trajectory, torch.Tensor):
+            trajectory = trajectory.detach().cpu().numpy()
+        if trajectory.ndim == 2:
+            trajectory = trajectory[np.newaxis, ...]
+        
+        texts = []
+        for b in range(trajectory.shape[0]):
+            points = []
+            for t in range(trajectory.shape[1]):
+                x, y = trajectory[b, t, 0], trajectory[b, t, 1]
+                points.append(f"{x:.2f},{y:.2f}")
+            texts.append(";".join(points))
+        return texts
+    
+    @staticmethod
+    def text_to_trajectory(texts, trajectory_length=45):
+        """
+        解析生成的文本为轨迹张量
+        
+        Args:
+            texts: list of str ("x1,y1;x2,y2;...")
+            trajectory_length: 目标轨迹长度
+        Returns:
+            trajectory: [B, T, 2] tensor
+        """
+        batch = []
+        for text in texts:
+            points = []
+            if not text or not text.strip():
+                batch.append([[0.0, 0.0]] * trajectory_length)
+                continue
+            
+            parts = text.strip().split(";")
+            for part in parts[:trajectory_length]:
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    xy = part.split(",")
+                    if len(xy) >= 2:
+                        x = float(xy[0].strip())
+                        y = float(xy[1].strip())
+                        points.append([x, y])
+                except (ValueError, IndexError):
+                    continue
+            
+            # 用最后一个有效点填充
+            while len(points) < trajectory_length:
+                last = points[-1] if points else [0.0, 0.0]
+                points.append(list(last))
+            
+            batch.append(points[:trajectory_length])
+        return torch.tensor(batch, dtype=torch.float32)
+    
+    def generate_trajectory(
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
+        attention_mask: torch.Tensor,
+        max_new_tokens: int = 512
     ) -> torch.Tensor:
         """
-        推理模式: 仅返回轨迹预测
+        推理模式: token 生成 → 解析为轨迹坐标
+        
+        对应论文 Algorithm 1:
+        "Decode trajectory tokens: Obtain τ̂ = Decoder(f)"
         
         Args:
             pixel_values: [B, 3, H, 2W]
@@ -437,40 +580,78 @@ class V2XVLM(nn.Module):
         Returns:
             trajectory: [B, T, 2]
         """
+        was_training = self.training
         self.eval()
+        
         with torch.no_grad():
-            outputs = self.forward(
-                pixel_values,
-                input_ids,
-                attention_mask,
-                trajectory_gt=None,
-                return_features=False
+            generated_ids = self.student_model.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
             )
-        return outputs['trajectory_pred']
+            
+            # 仅解码新生成的 token (排除提示词)
+            gen_only = generated_ids[:, input_ids.shape[1]:]
+            generated_texts = self.processor.batch_decode(
+                gen_only, skip_special_tokens=True
+            )
+            
+            trajectory = self.text_to_trajectory(
+                generated_texts, self.trajectory_length
+            )
+        
+        if was_training:
+            self.train()
+        
+        return trajectory.to(pixel_values.device)
+    
+    def predict(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        推理模式: token 生成并返回轨迹预测
+        
+        Args:
+            pixel_values: [B, 3, H, 2W]
+            input_ids: [B, L]
+            attention_mask: [B, L]
+            
+        Returns:
+            trajectory: [B, T, 2]
+        """
+        return self.generate_trajectory(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
     
     def get_trainable_parameters(self, base_lr: float = 1e-6) -> List[Dict]:
         """
         获取可训练参数组 (不包括frozen teacher)
 
-        返回 param_groups 格式，支持差异化学习率：
+        返回 param_groups 格式，按论文设置统一学习率：
         - backbone (Florence-2 student): base_lr
-        - 从零训练的模块 (trajectory_head, alignment, kd_proj): base_lr × 100
+        - 其余模块 (alignment, kd_proj, trajectory_head): base_lr
         """
-        head_lr = base_lr * 100  # 1e-4 for randomly-initialized heads
-
         param_groups = [
             {'params': list(self.student_model.parameters()), 'lr': base_lr},
-            {'params': list(self.trajectory_head.parameters()), 'lr': head_lr},
+            {'params': list(self.trajectory_head.parameters()), 'lr': base_lr},
         ]
 
         if self.alignment_module is not None:
             param_groups.append(
-                {'params': list(self.alignment_module.parameters()), 'lr': head_lr}
+                {'params': list(self.alignment_module.parameters()), 'lr': base_lr}
             )
 
         if self.kd_proj is not None:
             param_groups.append(
-                {'params': list(self.kd_proj.parameters()), 'lr': head_lr}
+                {'params': list(self.kd_proj.parameters()), 'lr': base_lr}
             )
 
         return param_groups

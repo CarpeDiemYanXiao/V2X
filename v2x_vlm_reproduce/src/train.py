@@ -290,8 +290,7 @@ class Trainer:
         
         base_lr = float(train_config.get('learning_rate', 1e-6))
         
-        # 获取可训练参数组 (差异化学习率)
-        # backbone: base_lr, trajectory_head / alignment: base_lr × 100
+        # 获取可训练参数组 (论文: 统一学习率 1e-6)
         param_groups = self.model.get_trainable_parameters(base_lr=base_lr)
         
         # AdamW优化器
@@ -322,7 +321,7 @@ class Trainer:
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, backbone lr={base_lr}, head lr={base_lr*100}")
+        self.logger.info(f"Optimizer: AdamW, lr={base_lr}")
         self.logger.info(f"Scheduler: {scheduler_type}")
     
     def create_dataloaders(self):
@@ -365,6 +364,9 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
+            trajectory_labels = batch.get('trajectory_labels')
+            if trajectory_labels is not None:
+                trajectory_labels = trajectory_labels.to(self.device)
             
             # 梯度清零
             self.optimizer.zero_grad()
@@ -377,7 +379,8 @@ class Trainer:
                         pixel_values=pixel_values,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        trajectory_gt=trajectory_gt
+                        trajectory_gt=trajectory_gt,
+                        trajectory_labels=trajectory_labels
                     )
                     losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                     loss = losses['total']
@@ -399,7 +402,8 @@ class Trainer:
                     pixel_values=pixel_values,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    trajectory_gt=trajectory_gt
+                    trajectory_gt=trajectory_gt,
+                    trajectory_labels=trajectory_labels
                 )
                 losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                 loss = losses['total']
@@ -451,13 +455,17 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
+            trajectory_labels = batch.get('trajectory_labels')
+            if trajectory_labels is not None:
+                trajectory_labels = trajectory_labels.to(self.device)
 
             # 前向传播
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                trajectory_gt=trajectory_gt
+                trajectory_gt=trajectory_gt,
+                trajectory_labels=trajectory_labels
             )
 
             losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
@@ -466,8 +474,15 @@ class Trainer:
             val_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
             num_batches += 1
 
+            # 使用生成模式预测轨迹
+            pred_traj = self.model.generate_trajectory(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+
             # 收集预测和GT
-            all_preds.append(outputs['trajectory_pred'].cpu())
+            all_preds.append(pred_traj.cpu())
             all_targets.append(trajectory_gt.cpu())
 
             # 收集障碍物数据 (已在 Collator 中 padding)
