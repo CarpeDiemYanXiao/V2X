@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data.dataset import V2XVLMDataset, V2XVLMCollator, create_dataloaders
 from models.v2x_vlm import V2XVLM
 from losses.v2x_loss import V2XVLMLoss
+from utils.metrics import compute_l2_error, compute_collision_rate
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
@@ -430,22 +431,24 @@ class Trainer:
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """验证"""
+        """验证 —— 输出论文全部 6 项指标"""
         self.model.eval()
-        
+
         val_losses = {
             'total': 0.0,
             'traj': 0.0,
-            'l2_error': 0.0
         }
+        all_preds = []
+        all_targets = []
+        all_obstacles = []
         num_batches = 0
-        
+
         for batch in tqdm(self.val_loader, desc="Validation"):
             pixel_values = batch['pixel_values'].to(self.device)
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            
+
             # 前向传播
             outputs = self.model(
                 pixel_values=pixel_values,
@@ -453,23 +456,46 @@ class Trainer:
                 attention_mask=attention_mask,
                 trajectory_gt=trajectory_gt
             )
-            
+
             losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
-            
-            # L2 Error计算
-            trajectory_pred = outputs['trajectory_pred']
-            l2_error = torch.sqrt(
-                ((trajectory_pred - trajectory_gt) ** 2).sum(dim=-1)
-            ).mean()
-            
+
             val_losses['total'] += losses['total'].item()
             val_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
-            val_losses['l2_error'] += l2_error.item()
             num_batches += 1
-        
+
+            # 收集预测和GT
+            all_preds.append(outputs['trajectory_pred'].cpu())
+            all_targets.append(trajectory_gt.cpu())
+
+            # 收集障碍物数据 (已在 Collator 中 padding)
+            if 'obstacle_positions' in batch:
+                # 根据 mask 只保留有效障碍物
+                obs = batch['obstacle_positions']          # [B, max_N, 2]
+                obs_mask = batch['obstacle_mask']           # [B, max_N]
+                all_obstacles.append((obs, obs_mask))
+
+        # 平均损失
         for key in val_losses:
             val_losses[key] /= max(num_batches, 1)
-        
+
+        # 拼接所有样本
+        all_preds_np = torch.cat(all_preds, dim=0).numpy()
+        all_targets_np = torch.cat(all_targets, dim=0).numpy()
+
+        # ===== L2 Error @ 2.5s / 3.5s / 4.5s + avg =====
+        l2_metrics = compute_l2_error(all_preds_np, all_targets_np)
+        val_losses.update(l2_metrics)   # l2_2.5s, l2_3.5s, l2_4.5s, l2_avg
+
+        # ===== Collision Rate @ 2.5s / 3.5s / 4.5s + avg =====
+        if all_obstacles:
+            # 拼接并展开障碍物
+            obs_list = []
+            for obs, mask in all_obstacles:
+                obs_list.append(obs)  # [B_i, max_N, 2]
+            all_obs_np = torch.cat(obs_list, dim=0).numpy()  # [B_total, max_N, 2]
+            col_metrics = compute_collision_rate(all_preds_np, all_obs_np)
+            val_losses.update(col_metrics)  # col_2.5s, col_3.5s, col_4.5s, col_avg
+
         return val_losses
     
     def train(self):
@@ -496,8 +522,23 @@ class Trainer:
             self.logger.info(
                 f"Epoch {self.current_epoch} Val - "
                 f"Total: {val_losses['total']:.4f}, "
-                f"Traj: {val_losses['traj']:.4f}, "
-                f"L2 Error: {val_losses['l2_error']:.4f}m"
+                f"Traj: {val_losses['traj']:.4f}"
+            )
+            # 论文指标: L2 Error (m)
+            self.logger.info(
+                f"  L2 Error  - "
+                f"@2.5s: {val_losses.get('l2_2.5s', -1):.4f}m, "
+                f"@3.5s: {val_losses.get('l2_3.5s', -1):.4f}m, "
+                f"@4.5s: {val_losses.get('l2_4.5s', -1):.4f}m, "
+                f"Avg: {val_losses.get('l2_avg', -1):.4f}m"
+            )
+            # 论文指标: Collision Rate (%)
+            self.logger.info(
+                f"  Col Rate  - "
+                f"@2.5s: {val_losses.get('col_2.5s', -1)*100:.2f}%, "
+                f"@3.5s: {val_losses.get('col_3.5s', -1)*100:.2f}%, "
+                f"@4.5s: {val_losses.get('col_4.5s', -1)*100:.2f}%, "
+                f"Avg: {val_losses.get('col_avg', -1)*100:.2f}%"
             )
             
             # 更新学习率

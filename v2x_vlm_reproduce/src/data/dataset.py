@@ -246,6 +246,46 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
         
         return combined_image
     
+    def _load_obstacle_positions(
+        self, vehicle_frame_id: str, ego_position: Tuple[float, float]
+    ) -> np.ndarray:
+        """
+        加载障碍物世界坐标并转换为自车坐标系
+
+        用于碰撞率 (Collision Rate) 指标计算
+
+        Args:
+            vehicle_frame_id: 车端帧ID (与 label_world 文件名对应)
+            ego_position: 自车世界坐标 (x, y)
+
+        Returns:
+            obstacle_positions: [N_obs, 2] 自车坐标系下的障碍物xy位置
+        """
+        label_path = (
+            self.coop_dir / "cooperative" / "label_world" / f"{vehicle_frame_id}.json"
+        )
+
+        if not label_path.exists():
+            return np.zeros((0, 2), dtype=np.float32)
+
+        with open(label_path, 'r') as f:
+            labels = json.load(f)
+
+        if not labels:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        positions = []
+        for obj in labels:
+            loc = obj.get('3d_location', {})
+            x = float(loc.get('x', 0))
+            y = float(loc.get('y', 0))
+            # 世界坐标 → 自车坐标 (平移)
+            x_ego = x - ego_position[0]
+            y_ego = y - ego_position[1]
+            positions.append([x_ego, y_ego])
+
+        return np.array(positions, dtype=np.float32)
+
     def __len__(self) -> int:
         return len(self.samples)
     
@@ -287,11 +327,17 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
                 'text': text_prompt
             }
         
+        # 加载障碍物位置 (用于碰撞率 Collision Rate 计算)
+        obstacle_positions = self._load_obstacle_positions(
+            sample['vehicle_frame_id'], ego_position
+        )
+
         return {
             **inputs,
             'trajectory_gt': torch.from_numpy(trajectory),
             'frame_id': sample['vehicle_frame_id'],
-            'ego_position': torch.tensor(ego_position, dtype=torch.float32)
+            'ego_position': torch.tensor(ego_position, dtype=torch.float32),
+            'obstacle_positions': torch.from_numpy(obstacle_positions),  # [N_obs, 2]
         }
 
 
@@ -334,14 +380,34 @@ class V2XVLMCollator:
         trajectory_gt = torch.stack([item['trajectory_gt'] for item in batch])
         ego_positions = torch.stack([item['ego_position'] for item in batch])
         frame_ids = [item['frame_id'] for item in batch]
-        
+
+        # 处理变长障碍物位置: padding 到批次内最大数量
+        obstacle_list = [item['obstacle_positions'] for item in batch]
+        max_n_obs = max(obs.size(0) for obs in obstacle_list) if obstacle_list else 0
+        max_n_obs = max(max_n_obs, 1)  # 至少保留1个位置以避免空张量
+
+        padded_obstacles = []
+        obstacle_masks = []
+        for obs in obstacle_list:
+            n_obs = obs.size(0)
+            pad_n = max_n_obs - n_obs
+            if pad_n > 0:
+                obs = torch.cat([obs, torch.zeros(pad_n, 2, dtype=obs.dtype)], dim=0)
+                mask = torch.cat([torch.ones(n_obs), torch.zeros(pad_n)])
+            else:
+                mask = torch.ones(n_obs)
+            padded_obstacles.append(obs)
+            obstacle_masks.append(mask)
+
         return {
             'pixel_values': pixel_values,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'trajectory_gt': trajectory_gt,
             'ego_position': ego_positions,
-            'frame_id': frame_ids
+            'frame_id': frame_ids,
+            'obstacle_positions': torch.stack(padded_obstacles),   # [B, max_N_obs, 2]
+            'obstacle_mask': torch.stack(obstacle_masks),          # [B, max_N_obs]
         }
 
 
