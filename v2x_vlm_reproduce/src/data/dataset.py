@@ -155,18 +155,21 @@ class V2XVLMDataset(Dataset):
         
         return samples
     
-    def _load_ego_position(self, vehicle_frame_id: str) -> Tuple[float, float]:
+    def _load_ego_position(self, vehicle_frame_id: str) -> Tuple[float, float, float]:
         """
-        加载自车世界坐标位置
+        加载自车世界坐标位置和航向角
         
         论文 Section 4.1:
         "The ego vehicle's position in the text prompt is represented in the 
         Virtual World Coordinate System provided by the dataset"
+
+        Returns:
+            (x, y, yaw) — 世界坐标位置和航向角(弧度)
         """
         meta = self.vehicle_meta.get(vehicle_frame_id, {})
         
         if not meta:
-            return (0.0, 0.0)
+            return (0.0, 0.0, 0.0)
         
         pose_path = self.vehicle_side / meta.get('calib_novatel_to_world_path', '')
         
@@ -175,9 +178,12 @@ class V2XVLMDataset(Dataset):
                 pose = json.load(f)
             x = pose['translation'][0][0]
             y = pose['translation'][1][0]
-            return (x, y)
+            # 从旋转矩阵提取航向角 (与 generate_trajectory_gt.py 保持一致)
+            rotation = np.array(pose['rotation'])
+            yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+            return (x, y, yaw)
         
-        return (0.0, 0.0)
+        return (0.0, 0.0, 0.0)
     
     def _construct_prompt(
         self, 
@@ -210,7 +216,7 @@ class V2XVLMDataset(Dataset):
 
 Infrastructure View: {i_desc}
 
-Current Ego Vehicle Position: x={ego_position[0]:.2f}m, y={ego_position[1]:.2f}m
+Current Ego Vehicle Position: x={ego_position[0]:.2f}m, y={ego_position[1]:.2f}m (heading={ego_position[2]:.4f}rad)
 
 Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. Output a sequence of 45 waypoints (x, y) at 10Hz in the ego-centric coordinate system."""
 
@@ -247,19 +253,21 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
         return combined_image
     
     def _load_obstacle_positions(
-        self, vehicle_frame_id: str, ego_position: Tuple[float, float]
+        self, vehicle_frame_id: str, ego_position: Tuple[float, float, float]
     ) -> np.ndarray:
         """
-        加载障碍物世界坐标并转换为自车坐标系
+        加载障碍物世界坐标并转换为 ego-centric 坐标系
 
-        用于碰撞率 (Collision Rate) 指标计算
+        坐标变换与 GT 轨迹完全一致 (world_to_ego_centric):
+        1. 平移: dx = x_world - x_ego,  dy = y_world - y_ego
+        2. 旋转: 使自车朝向为 x 轴正方向
 
         Args:
             vehicle_frame_id: 车端帧ID (与 label_world 文件名对应)
-            ego_position: 自车世界坐标 (x, y)
+            ego_position: (x, y, yaw) 自车世界坐标和航向角
 
         Returns:
-            obstacle_positions: [N_obs, 2] 自车坐标系下的障碍物xy位置
+            obstacle_positions: [N_obs, 2] ego-centric 坐标系下的障碍物 xy 位置
         """
         label_path = (
             self.coop_dir / "cooperative" / "label_world" / f"{vehicle_frame_id}.json"
@@ -274,15 +282,22 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
         if not labels:
             return np.zeros((0, 2), dtype=np.float32)
 
+        cx, cy, cyaw = ego_position
+        cos_yaw = np.cos(-cyaw)
+        sin_yaw = np.sin(-cyaw)
+
         positions = []
         for obj in labels:
             loc = obj.get('3d_location', {})
-            x = float(loc.get('x', 0))
-            y = float(loc.get('y', 0))
-            # 世界坐标 → 自车坐标 (平移)
-            x_ego = x - ego_position[0]
-            y_ego = y - ego_position[1]
-            positions.append([x_ego, y_ego])
+            wx = float(loc.get('x', 0))
+            wy = float(loc.get('y', 0))
+            # 1. 平移到自车中心
+            dx = wx - cx
+            dy = wy - cy
+            # 2. 旋转到自车朝向 (与 generate_trajectory_gt.py 一致)
+            ex = dx * cos_yaw - dy * sin_yaw
+            ey = dx * sin_yaw + dy * cos_yaw
+            positions.append([ex, ey])
 
         return np.array(positions, dtype=np.float32)
 
@@ -336,7 +351,7 @@ Task: Plan the future trajectory for the ego vehicle over the next 4.5 seconds. 
             **inputs,
             'trajectory_gt': torch.from_numpy(trajectory),
             'frame_id': sample['vehicle_frame_id'],
-            'ego_position': torch.tensor(ego_position, dtype=torch.float32),
+            'ego_position': torch.tensor(ego_position[:2], dtype=torch.float32),  # prompt只用xy
             'obstacle_positions': torch.from_numpy(obstacle_positions),  # [N_obs, 2]
         }
 
