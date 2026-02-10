@@ -62,7 +62,7 @@ loss:
 # 数据配置 - NPU优化
 # ============================================
 data:
-  root: "../data"           # 相对路径，或云服务器绝对路径
+  root: "/root/autodl-tmp/data"  # AutoDL 服务器路径
   image_size: [768, 768]
   trajectory_horizon: 45
   fps: 10

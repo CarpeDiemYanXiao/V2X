@@ -37,7 +37,7 @@ loss:
 
 # 数据配置
 data:
-  root: "../data"           # 云服务器数据路径
+  root: "/root/autodl-tmp/data"  # AutoDL 服务器路径
   image_size: [768, 768]
   trajectory_horizon: 45
   fps: 10

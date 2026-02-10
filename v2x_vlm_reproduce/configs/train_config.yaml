@@ -75,8 +75,8 @@ loss:
 # 数据配置
 # ============================================
 data:
-  # 数据根目录 (相对于 v2x_vlm_reproduce 目录)
-  root: "../data"
+  # 数据根目录 (AutoDL 服务器路径)
+  root: "/root/autodl-tmp/data"
   
   # 图像设置
   image_size: [768, 768]    # Florence-2 输入尺寸
