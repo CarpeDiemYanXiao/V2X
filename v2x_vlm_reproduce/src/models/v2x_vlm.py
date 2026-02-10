@@ -148,10 +148,11 @@ class V2XVLM(nn.Module):
         )
         
         # 特征对齐模块 (用于对比学习)
+        # 论文 Section 4.3: 对齐 student 视觉编码器 (768d) 与 teacher 文本表示 (1024d)
         if use_contrastive_alignment:
             self.alignment_module = FeatureAlignment(
-                vision_dim=hidden_dim,
-                text_dim=hidden_dim,
+                vision_dim=hidden_dim,               # student: 768
+                text_dim=teacher_hidden_dim,          # teacher: 1024
                 projection_dim=projection_dim,
                 temperature=temperature
             )
@@ -176,167 +177,111 @@ class V2XVLM(nn.Module):
         attention_mask: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        提取多模态特征
-        
+        分步提取三种独立的多模态特征
+
         论文 Section 4.2:
-        - 视觉编码: F_v = f_v([I_v, I_i])
-        - 文本编码: F_t = f_t(E)
-        - 多模态融合: F_multi = MultiModalTransformer(F_v, F_t)
-        
-        Florence-2 是 encoder-decoder 架构：
+        - 视觉编码: F_v = f_v([I_v, I_i])           → vision_features  (纯视觉)
+        - 文本编码: F_t = f_t(E)                     → text_embeddings  (纯文本)
+        - 多模态融合: F_multi = Decoder(Enc(F_v,F_t)) → fusion_features  (解码器输出)
+
+        Florence-2 内部结构:
         - vision_tower (DaViT): 图像编码
-        - language_model (BART-like): encoder处理文本, decoder生成输出
-        
-        需要提供 decoder_input_ids 来获取 decoder hidden states
+        - image_proj_norm + image_projection: 投影到语言模型维度
+        - language_model (BART-like): encoder 处理 [image;text], decoder 生成
         """
-        # 获取模型的hidden_dim (base=768, large=1024)
-        if model == self.student_model:
-            model_hidden_dim = self.hidden_dim
-        else:
-            model_hidden_dim = self.teacher_hidden_dim
-        
+        model_hidden_dim = self.hidden_dim if model == self.student_model else self.teacher_hidden_dim
         batch_size = pixel_values.shape[0]
         device = pixel_values.device
         dtype = pixel_values.dtype
-        
+
+        # ========== Step 1: 纯视觉特征 F_v (DaViT + projection) ==========
         try:
-            # Florence-2 需要 decoder_input_ids
-            # 使用 input_ids 作为 decoder_input_ids (自回归方式)
-            # 或者使用 BOS token 开始解码
-            
-            # 方法1: 直接使用完整的 forward
-            outputs = model(
-                input_ids=input_ids,              # encoder 输入 (文本prompt)
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                decoder_input_ids=input_ids,      # decoder 输入 (用于teacher forcing)
+            if hasattr(model, '_encode_image'):
+                # Florence-2 自带方法: vision_tower → reshape → norm → projection
+                vision_features = model._encode_image(pixel_values)
+            else:
+                vision_features = model.vision_tower(pixel_values)
+                if isinstance(vision_features, tuple):
+                    vision_features = vision_features[0]
+                if hasattr(vision_features, 'last_hidden_state'):
+                    vision_features = vision_features.last_hidden_state
+                if hasattr(model, 'image_proj_norm'):
+                    vision_features = model.image_proj_norm(vision_features)
+                if hasattr(model, 'image_projection'):
+                    vision_features = model.image_projection(vision_features)
+        except Exception as e:
+            print(f"Warning: Vision feature extraction failed: {e}")
+            vision_features = torch.zeros(batch_size, 1, model_hidden_dim, device=device, dtype=dtype)
+
+        # 确保 [B, N_v, D]
+        if vision_features.dim() == 4:
+            B, C, H, W = vision_features.shape
+            vision_features = vision_features.flatten(2).permute(0, 2, 1)
+        if vision_features.dim() == 2:
+            vision_features = vision_features.unsqueeze(1)
+
+        # ========== Step 2: 纯文本嵌入 F_t (embed_tokens, 无上下文混合) ==========
+        try:
+            encoder = model.language_model.model.encoder
+            text_embeddings = encoder.embed_tokens(input_ids)  # [B, N_t, D]
+        except Exception as e:
+            print(f"Warning: Text embedding extraction failed: {e}")
+            text_embeddings = torch.zeros(batch_size, input_ids.shape[1], model_hidden_dim, device=device, dtype=dtype)
+
+        # ========== Step 3: 融合特征 F_multi (encoder-decoder pipeline) ==========
+        try:
+            # 3a. 拼接 [image_tokens; text_tokens] 送入 encoder
+            encoder_inputs = torch.cat([vision_features, text_embeddings], dim=1)
+            image_mask = torch.ones(
+                batch_size, vision_features.shape[1], device=device, dtype=attention_mask.dtype
+            )
+            combined_mask = torch.cat([image_mask, attention_mask], dim=1)
+
+            encoder_outputs = encoder(
+                inputs_embeds=encoder_inputs,
+                attention_mask=combined_mask,
                 output_hidden_states=True,
                 return_dict=True
             )
-            
-            # 提取融合特征 - 优先使用 decoder_hidden_states
-            if hasattr(outputs, 'decoder_hidden_states') and outputs.decoder_hidden_states is not None:
-                # decoder_hidden_states 是 tuple，取最后一层
-                fusion_features = outputs.decoder_hidden_states[-1]  # [B, seq_len, D]
-            elif hasattr(outputs, 'encoder_hidden_states') and outputs.encoder_hidden_states is not None:
-                fusion_features = outputs.encoder_hidden_states[-1]
-            elif hasattr(outputs, 'encoder_last_hidden_state') and outputs.encoder_last_hidden_state is not None:
-                fusion_features = outputs.encoder_last_hidden_state
-            else:
-                # 使用 logits 的隐藏表示（不推荐，但作为后备）
-                # Florence-2 的 logits shape: [B, seq_len, vocab_size]
-                # 我们需要从模型内部获取 hidden state
-                raise RuntimeError("Cannot extract hidden states from model outputs")
-            
-            # 确保特征维度正确
-            if fusion_features.dim() == 2:
-                fusion_features = fusion_features.unsqueeze(1)  # [B, 1, D]
-            
-            return {
-                'vision_features': fusion_features,
-                'text_embeddings': fusion_features,
-                'fusion_features': fusion_features
-            }
-            
+
+            # 3b. Decoder: 用 input_ids 的 embedding 作为 decoder 输入
+            decoder = model.language_model.model.decoder
+            decoder_input_embeds = encoder.embed_tokens(input_ids)
+            decoder_outputs = decoder(
+                inputs_embeds=decoder_input_embeds,
+                encoder_hidden_states=encoder_outputs.last_hidden_state,
+                encoder_attention_mask=combined_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            fusion_features = decoder_outputs.last_hidden_state  # [B, N_dec, D]
         except Exception as e:
-            # 如果标准 forward 失败，尝试分步提取特征
+            print(f"Warning: Fusion extraction via manual pipeline failed: {e}")
+            # Fallback: 调用完整 forward
             try:
-                return self._extract_features_fallback(model, pixel_values, input_ids, attention_mask, model_hidden_dim)
-            except Exception as e2:
-                print(f"Warning: All feature extraction methods failed: {e2}")
-                import traceback
-                traceback.print_exc()
-                # 最后的fallback: 使用随机特征 (仅用于调试，实际训练中不应到达这里)
-                dummy_features = torch.randn(
-                    batch_size, input_ids.shape[1], model_hidden_dim,
-                    device=device, dtype=dtype
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    decoder_input_ids=input_ids,
+                    output_hidden_states=True,
+                    return_dict=True
                 )
-                return {
-                    'vision_features': dummy_features,
-                    'text_embeddings': dummy_features,
-                    'fusion_features': dummy_features
-                }
-    
-    def _extract_features_fallback(
-        self,
-        model: nn.Module,
-        pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        hidden_dim: int
-    ) -> Dict[str, torch.Tensor]:
-        """
-        备用特征提取方法：分步提取视觉和文本特征
-        
-        Florence-2 内部结构:
-        - model.vision_tower: DaViT 视觉编码器
-        - model.image_proj_norm + model.image_projection: 图像投影
-        - model.language_model: BART-like encoder-decoder
-        """
-        batch_size = pixel_values.shape[0]
-        device = pixel_values.device
-        dtype = pixel_values.dtype
-        
-        # 1. 提取视觉特征
-        if hasattr(model, 'vision_tower'):
-            # DaViT 视觉编码器
-            vision_outputs = model.vision_tower(pixel_values)
-            
-            # 获取特征 (DaViT 输出格式可能不同)
-            if hasattr(vision_outputs, 'last_hidden_state'):
-                vision_features = vision_outputs.last_hidden_state
-            elif isinstance(vision_outputs, tuple):
-                vision_features = vision_outputs[0]
-            else:
-                vision_features = vision_outputs
-            
-            # Florence-2 的图像投影
-            if hasattr(model, 'image_projection'):
-                # 可能需要先 norm
-                if hasattr(model, 'image_proj_norm'):
-                    vision_features = model.image_proj_norm(vision_features)
-                vision_features = model.image_projection(vision_features)
-        else:
-            # 没有 vision_tower，使用简单的 CNN 特征
-            vision_features = torch.randn(batch_size, 256, hidden_dim, device=device, dtype=dtype)
-        
-        # 2. 提取文本 embeddings
-        if hasattr(model, 'language_model') and hasattr(model.language_model, 'model'):
-            if hasattr(model.language_model.model, 'encoder'):
-                # BART-like encoder
-                encoder = model.language_model.model.encoder
-                if hasattr(encoder, 'embed_tokens'):
-                    text_embeddings = encoder.embed_tokens(input_ids)
+                if hasattr(outputs, 'decoder_hidden_states') and outputs.decoder_hidden_states is not None:
+                    fusion_features = outputs.decoder_hidden_states[-1]
                 else:
-                    text_embeddings = vision_features  # fallback
-            else:
-                text_embeddings = vision_features
-        else:
-            text_embeddings = vision_features
-        
-        # 3. 简单融合：拼接 + 平均
-        # vision_features: [B, N_v, D]
-        # text_embeddings: [B, N_t, D]
-        
-        # 确保维度匹配
-        if vision_features.dim() == 4:
-            # [B, C, H, W] -> [B, H*W, C]
-            B, C, H, W = vision_features.shape
-            vision_features = vision_features.flatten(2).permute(0, 2, 1)
-        
-        if vision_features.shape[-1] != hidden_dim:
-            # 需要投影
-            vision_features = F.adaptive_avg_pool1d(
-                vision_features.permute(0, 2, 1), hidden_dim
-            ).permute(0, 2, 1)
-        
-        # 使用视觉特征作为融合特征（简化方案）
-        fusion_features = vision_features
-        
+                    fusion_features = torch.cat([vision_features, text_embeddings], dim=1)
+            except Exception as e2:
+                print(f"Warning: Full forward also failed: {e2}")
+                fusion_features = torch.cat([vision_features, text_embeddings], dim=1)
+
+        if fusion_features.dim() == 2:
+            fusion_features = fusion_features.unsqueeze(1)
+
         return {
-            'vision_features': vision_features,
-            'text_embeddings': text_embeddings if text_embeddings.shape[-1] == hidden_dim else vision_features,
-            'fusion_features': fusion_features
+            'vision_features': vision_features,   # [B, N_v, D] 纯视觉
+            'text_embeddings': text_embeddings,    # [B, N_t, D] 纯文本
+            'fusion_features': fusion_features     # [B, N_d, D] 多模态融合
         }
     
     def forward(
@@ -380,8 +325,11 @@ class V2XVLM(nn.Module):
         )
         outputs['trajectory_pred'] = trajectory_pred  # [B, T, 2]
         
-        # ========== Teacher Forward (for KD) ==========
-        if self.use_kd and self.teacher_model is not None:
+        # ========== Teacher Forward (for KD and/or contrastive alignment) ==========
+        need_teacher = (
+            (self.use_kd or self.use_alignment) and self.teacher_model is not None
+        )
+        if need_teacher:
             with torch.no_grad():
                 teacher_features = self.encode_multimodal(
                     self.teacher_model,
@@ -400,10 +348,11 @@ class V2XVLM(nn.Module):
             losses['loss_traj'] = loss_traj
         
         # 2. 对比对齐损失 L_align [Eq.12]
-        if self.use_alignment and self.alignment_module is not None:
+        #    论文: z_v = g_v(f_v^student(I))  vs  z_t = g_t(f_t^teacher(E))
+        if self.use_alignment and self.alignment_module is not None and 'teacher_features' in outputs:
             z_v, z_t = self.alignment_module(
-                student_features['vision_features'],
-                student_features['text_embeddings']
+                student_features['vision_features'],              # student 视觉
+                outputs['teacher_features']['text_embeddings']    # teacher 文本
             )
             loss_align = self.alignment_module.compute_loss(z_v, z_t)
             losses['loss_align'] = loss_align
@@ -499,25 +448,32 @@ class V2XVLM(nn.Module):
             )
         return outputs['trajectory_pred']
     
-    def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """获取可训练参数 (不包括frozen teacher)"""
-        params = []
-        
-        # Student model parameters
-        params.extend(self.student_model.parameters())
-        
-        # Trajectory head
-        params.extend(self.trajectory_head.parameters())
-        
-        # Alignment module
+    def get_trainable_parameters(self, base_lr: float = 1e-6) -> List[Dict]:
+        """
+        获取可训练参数组 (不包括frozen teacher)
+
+        返回 param_groups 格式，支持差异化学习率：
+        - backbone (Florence-2 student): base_lr
+        - 从零训练的模块 (trajectory_head, alignment, kd_proj): base_lr × 100
+        """
+        head_lr = base_lr * 100  # 1e-4 for randomly-initialized heads
+
+        param_groups = [
+            {'params': list(self.student_model.parameters()), 'lr': base_lr},
+            {'params': list(self.trajectory_head.parameters()), 'lr': head_lr},
+        ]
+
         if self.alignment_module is not None:
-            params.extend(self.alignment_module.parameters())
-        
-        # KD projection
+            param_groups.append(
+                {'params': list(self.alignment_module.parameters()), 'lr': head_lr}
+            )
+
         if self.kd_proj is not None:
-            params.extend(self.kd_proj.parameters())
-        
-        return params
+            param_groups.append(
+                {'params': list(self.kd_proj.parameters()), 'lr': head_lr}
+            )
+
+        return param_groups
     
     def save_checkpoint(self, path: str, optimizer=None, epoch: int = 0, **kwargs):
         """保存检查点"""

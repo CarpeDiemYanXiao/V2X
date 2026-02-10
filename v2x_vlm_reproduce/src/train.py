@@ -288,13 +288,16 @@ class Trainer:
         """初始化优化器和学习率调度器"""
         train_config = self.config.get('training', {})
         
-        # 获取可训练参数
-        params = self.model.get_trainable_parameters()
+        base_lr = float(train_config.get('learning_rate', 1e-6))
+        
+        # 获取可训练参数组 (差异化学习率)
+        # backbone: base_lr, trajectory_head / alignment: base_lr × 100
+        param_groups = self.model.get_trainable_parameters(base_lr=base_lr)
         
         # AdamW优化器
         self.optimizer = AdamW(
-            params,
-            lr=float(train_config.get('learning_rate', 1e-6)),
+            param_groups,
+            lr=base_lr,                # 默认 lr (会被 param_group 覆盖)
             weight_decay=float(train_config.get('weight_decay', 0.01)),
             betas=(0.9, 0.999)
         )
@@ -319,7 +322,7 @@ class Trainer:
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, lr={train_config.get('learning_rate', 1e-6)}")
+        self.logger.info(f"Optimizer: AdamW, backbone lr={base_lr}, head lr={base_lr*100}")
         self.logger.info(f"Scheduler: {scheduler_type}")
     
     def create_dataloaders(self):
