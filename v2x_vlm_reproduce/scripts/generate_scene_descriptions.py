@@ -57,13 +57,15 @@ def generate_scene_descriptions(
         trust_remote_code=True,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         cache_dir=str(cache_dir),
-        attn_implementation="eager"
+        attn_implementation="eager",
+        local_files_only=True
     ).to(device)
     
     processor = AutoProcessor.from_pretrained(
         "microsoft/Florence-2-large",
         trust_remote_code=True,
-        cache_dir=str(cache_dir)
+        cache_dir=str(cache_dir),
+        local_files_only=True
     )
     
     model.eval()

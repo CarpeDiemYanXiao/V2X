@@ -111,12 +111,14 @@ class V2XVLM(nn.Module):
             student_model_name,
             trust_remote_code=True,
             cache_dir=cache_dir,
-            attn_implementation="eager"
+            attn_implementation="eager",
+            local_files_only=True
         )
         self.processor = AutoProcessor.from_pretrained(
             student_model_name,
             trust_remote_code=True,
-            cache_dir=cache_dir
+            cache_dir=cache_dir,
+            local_files_only=True
         )
         
         # Teacher Model - Florence-2-Large (frozen)
@@ -126,7 +128,8 @@ class V2XVLM(nn.Module):
                 teacher_model_name,
                 trust_remote_code=True,
                 cache_dir=cache_dir,
-                attn_implementation="eager"
+                attn_implementation="eager",
+                local_files_only=True
             )
             if freeze_teacher:
                 for param in self.teacher_model.parameters():
