@@ -491,11 +491,15 @@ class Trainer:
 
         # ===== Collision Rate @ 2.5s / 3.5s / 4.5s + avg =====
         if all_obstacles:
-            # 拼接并展开障碍物
-            obs_list = []
+            # 各批次 max_N_obs 可能不同，需统一 pad 到全局最大值
+            global_max_n = max(obs.shape[1] for obs, _ in all_obstacles)
+            padded_obs_list = []
             for obs, mask in all_obstacles:
-                obs_list.append(obs)  # [B_i, max_N, 2]
-            all_obs_np = torch.cat(obs_list, dim=0).numpy()  # [B_total, max_N, 2]
+                pad_n = global_max_n - obs.shape[1]
+                if pad_n > 0:
+                    obs = torch.cat([obs, torch.zeros(obs.shape[0], pad_n, 2, dtype=obs.dtype)], dim=1)
+                padded_obs_list.append(obs)
+            all_obs_np = torch.cat(padded_obs_list, dim=0).numpy()  # [B_total, global_max_N, 2]
             col_metrics = compute_collision_rate(all_preds_np, all_obs_np)
             val_losses.update(col_metrics)  # col_2.5s, col_3.5s, col_4.5s, col_avg
 
