@@ -497,7 +497,7 @@ class Trainer:
             for obs, mask in all_obstacles:
                 pad_n = global_max_n - obs.shape[1]
                 if pad_n > 0:
-                    obs = torch.cat([obs, torch.zeros(obs.shape[0], pad_n, 2, dtype=obs.dtype)], dim=1)
+                    obs = torch.cat([obs, torch.full((obs.shape[0], pad_n, 2), 1e6, dtype=obs.dtype)], dim=1)
                 padded_obs_list.append(obs)
             all_obs_np = torch.cat(padded_obs_list, dim=0).numpy()  # [B_total, global_max_N, 2]
             col_metrics = compute_collision_rate(all_preds_np, all_obs_np)

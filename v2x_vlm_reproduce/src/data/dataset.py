@@ -407,7 +407,7 @@ class V2XVLMCollator:
             n_obs = obs.size(0)
             pad_n = max_n_obs - n_obs
             if pad_n > 0:
-                obs = torch.cat([obs, torch.zeros(pad_n, 2, dtype=obs.dtype)], dim=0)
+                obs = torch.cat([obs, torch.full((pad_n, 2), 1e6, dtype=obs.dtype)], dim=0)
                 mask = torch.cat([torch.ones(n_obs), torch.zeros(pad_n)])
             else:
                 mask = torch.ones(n_obs)
