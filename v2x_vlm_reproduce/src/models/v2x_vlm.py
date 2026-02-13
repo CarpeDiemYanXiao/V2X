@@ -587,16 +587,19 @@ class V2XVLM(nn.Module):
             generated_ids = self.student_model.generate(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
-                attention_mask=attention_mask,
+                # 注意: 不传 attention_mask!
+                # Florence-2 内部会拼接 image tokens + text tokens 并自动生成正确的 mask
+                # 外部传入的 attention_mask 仅覆盖 text tokens, 会导致尺寸不匹配
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 num_beams=1,
             )
             
-            # 仅解码新生成的 token (排除提示词)
-            gen_only = generated_ids[:, input_ids.shape[1]:]
+            # Florence-2 是 encoder-decoder 架构
+            # generate() 返回的是 decoder 输出 (不含 encoder input_ids)
+            # 直接解码即可, 无需截断
             generated_texts = self.processor.batch_decode(
-                gen_only, skip_special_tokens=True
+                generated_ids, skip_special_tokens=True
             )
             
             trajectory = self.text_to_trajectory(
