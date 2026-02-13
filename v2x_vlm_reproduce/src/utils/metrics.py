@@ -100,23 +100,32 @@ def compute_collision_rate(
     pred: Union[torch.Tensor, np.ndarray],
     obstacle_positions: Union[torch.Tensor, np.ndarray],
     ego_size: Tuple[float, float] = (4.5, 1.8),
+    obstacle_size: Tuple[float, float] = (4.5, 1.8),
     eval_times: tuple = (2.5, 3.5, 4.5),
-    hz: int = 10,
-    safety_margin: float = 0.5
+    hz: int = 10
 ) -> Dict[str, float]:
     """
     计算碰撞率
-    
-    使用简化的边界框碰撞检测
-    
+
+    论文 Table 2: "collision rate defined by oriented bounding-box overlap
+    between the predicted ego trajectory and surrounding obstacles"
+
+    简化为圆形碰撞检测:
+    - ego 碰撞半径 = ego 对角线 / 2
+    - obstacle 碰撞半径 = obstacle 对角线 / 2
+    - 碰撞条件: 两圆心距离 < ego_r + obs_r
+
+    注意: 障碍物位置为当前帧标注, 假设静止.
+    只在自车附近 (< 50m) 的障碍物参与碰撞检测, 远处障碍物不会真正碰撞.
+
     Args:
         pred: 预测轨迹 [B, T, 2]
-        obstacle_positions: 障碍物位置 [B, N_obs, T, 2] 或 [B, N_obs, 2]
-        ego_size: 自车尺寸 (长, 宽)
+        obstacle_positions: 障碍物位置 [B, N_obs, 2] (ego-centric)
+        ego_size: 自车尺寸 (长, 宽) 米
+        obstacle_size: 障碍物尺寸 (长, 宽) 米
         eval_times: 评估时间点
         hz: 采样频率
-        safety_margin: 安全边距
-        
+
     Returns:
         collision_rates: 各时间点碰撞率
     """
@@ -124,46 +133,58 @@ def compute_collision_rate(
         pred = pred.detach().cpu().numpy()
     if isinstance(obstacle_positions, torch.Tensor):
         obstacle_positions = obstacle_positions.detach().cpu().numpy()
-    
+
     if pred.ndim == 2:
         pred = pred[np.newaxis, ...]
-    
+
     batch_size, num_steps, _ = pred.shape
-    
-    # 碰撞半径 (简化为圆形)
-    collision_radius = (ego_size[0] + ego_size[1]) / 4 + safety_margin
-    
+
+    # 碰撞判定: 用两个物体的等效圆半径之和
+    # 等效圆半径 ≈ sqrt(L^2 + W^2) / 2 (对角线的一半)
+    # 但这太大了, 实际碰撞用更紧凑的估计: (L+W)/4
+    ego_r = (ego_size[0] + ego_size[1]) / 4      # ~1.575m
+    obs_r = (obstacle_size[0] + obstacle_size[1]) / 4  # ~1.575m
+    collision_threshold = ego_r + obs_r            # ~3.15m (两车中心距)
+
     metrics = {}
-    
+
     # 处理障碍物维度
     if obstacle_positions.ndim == 3:
-        # [B, N_obs, 2] -> 假设障碍物静止
+        # [B, N_obs, 2] -> 假设障碍物静止, 广播到所有时间步
+        # 预先过滤: 只保留距离原点 50m 以内的障碍物
+        # 距离原点太远的障碍物 (包括 1e6 padding) 不可能碰撞
+        obs_dist_to_origin = np.linalg.norm(obstacle_positions, axis=-1)  # [B, N_obs]
+        far_mask = obs_dist_to_origin > 50.0  # 远处的障碍物
+        # 将远处障碍物位置设为极大值, 不会触发碰撞
+        obstacle_positions = obstacle_positions.copy()
+        obstacle_positions[far_mask] = 1e6
+
         obstacle_positions = np.tile(
             obstacle_positions[:, :, np.newaxis, :],
             (1, 1, num_steps, 1)
         )
-    
+
     for t in eval_times:
         step = int(t * hz)
         step = min(step, num_steps)
-        
+
         # 预测轨迹片段
         pred_segment = pred[:, :step, :]  # [B, step, 2]
         obs_segment = obstacle_positions[:, :, :step, :]  # [B, N_obs, step, 2]
-        
-        # 计算距离
+
+        # 计算距离: ego 预测位置到每个障碍物的距离
         pred_expanded = pred_segment[:, np.newaxis, :, :]  # [B, 1, step, 2]
         distances = np.linalg.norm(pred_expanded - obs_segment, axis=-1)  # [B, N_obs, step]
-        
-        # 碰撞检测
-        collisions = (distances < collision_radius).any(axis=-1).any(axis=-1)  # [B]
-        
+
+        # 碰撞: 任意时间步任意障碍物距离 < 阈值
+        collisions = (distances < collision_threshold).any(axis=-1).any(axis=-1)  # [B]
+
         collision_rate = float(collisions.mean())
         metrics[f'col_{t}s'] = collision_rate
-    
+
     # 平均碰撞率
     metrics['col_avg'] = float(np.mean([metrics[f'col_{t}s'] for t in eval_times]))
-    
+
     return metrics
 
 
