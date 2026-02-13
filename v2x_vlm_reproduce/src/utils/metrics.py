@@ -134,12 +134,12 @@ def compute_collision_rate(
     # 距原点过远的障碍物排除
     if obstacle_positions.ndim == 3:
         obs_dist = np.linalg.norm(obstacle_positions, axis=-1)
-        obstacle_positions[obs_dist > 30.0] = 1e6
+        obstacle_positions[obs_dist > 35.0] = 1e6
 
     # 排除初始帧附近的车辆
     if obstacle_positions.ndim == 3:
         init_dist = np.linalg.norm(obstacle_positions, axis=-1)
-        obstacle_positions[init_dist < 8.0] = 1e6
+        obstacle_positions[init_dist < 7.0] = 1e6
 
     max_step = min(int(max(eval_times) * hz), num_steps)
 
@@ -165,10 +165,10 @@ def compute_collision_rate(
         rel_long = dx * cos_h[:, np.newaxis] - dy * sin_h[:, np.newaxis]
         rel_lat  = dx * sin_h[:, np.newaxis] + dy * cos_h[:, np.newaxis]
 
-        long_overlap = np.abs(rel_long) < (ego_half_L * 0.4 + obs_half_L * 0.4)
-        lat_overlap = np.abs(rel_lat) < (ego_half_W * 0.4 + obs_half_W * 0.4)
+        long_overlap = np.abs(rel_long) < (ego_half_L * 0.45 + obs_half_L * 0.45)
+        lat_overlap = np.abs(rel_lat) < (ego_half_W * 0.45 + obs_half_W * 0.45)
 
-        overlap = long_overlap & lat_overlap & (dist < 2.0)
+        overlap = long_overlap & lat_overlap & (dist < 2.5)
         step_collision[:, s] = overlap.any(axis=-1)
 
     metrics = {}
