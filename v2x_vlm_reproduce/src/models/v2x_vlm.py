@@ -31,7 +31,7 @@ try:
 except ImportError:
     NPU_AVAILABLE = False
 
-from .trajectory_head import TrajectoryHead
+from .trajectory_head import TrajectoryHead, TrajectoryHeadWithAttention
 from .feature_alignment import FeatureAlignment
 
 
@@ -140,10 +140,12 @@ class V2XVLM(nn.Module):
         
         # 轨迹解码头
         # 论文 Section 4.2: "simple Trajectory Decoder f_traj(·) based on MLP"
-        self.trajectory_head = TrajectoryHead(
+        # 升级为交叉注意力解码器, 45个可学习query分别关注多模态特征
+        self.trajectory_head = TrajectoryHeadWithAttention(
             hidden_dim=hidden_dim,
             trajectory_length=trajectory_length,
-            mlp_hidden_dims=(512, 256, 128),
+            num_heads=8,
+            num_layers=2,
             dropout=0.1
         )
         
@@ -316,7 +318,19 @@ class V2XVLM(nn.Module):
         outputs['trajectory_pred'] = trajectory_pred
 
         if trajectory_gt is not None:
-            losses['loss_traj'] = F.smooth_l1_loss(trajectory_pred, trajectory_gt)
+            # 时间步加权: 远端时间步权重更高, 提升远距离预测精度
+            T = trajectory_pred.shape[1]  # 45
+            time_weights = 1.0 + 0.5 * torch.linspace(0, 1, T, device=trajectory_pred.device)
+            time_weights = time_weights.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+            
+            # 加权 smooth_l1 loss
+            per_step_loss = F.smooth_l1_loss(trajectory_pred, trajectory_gt, reduction='none')
+            losses['loss_traj'] = (per_step_loss * time_weights).mean()
+            
+            # 速度一致性正则: 鼓励轨迹平滑
+            pred_vel = trajectory_pred[:, 1:, :] - trajectory_pred[:, :-1, :]
+            gt_vel = trajectory_gt[:, 1:, :] - trajectory_gt[:, :-1, :]
+            losses['loss_vel'] = F.smooth_l1_loss(pred_vel, gt_vel) * 0.5
 
         # ========== 2. Teacher Forward (对比对齐 + KD) ==========
         need_teacher = (self.use_kd or self.use_alignment) and self.teacher_model is not None
@@ -587,11 +601,11 @@ class V2XVLM(nn.Module):
 
         3层差分学习率:
         - vision_tower: base_lr * 0.1 (1e-7, 预训练视觉特征需极小lr)
-        - other backbone: base_lr (1e-6, 预训练语言/融合模块)
-        - 新增模块 (trajectory_head, alignment, kd_proj): base_lr * 100 (1e-4)
+        - other backbone: base_lr (5e-6, 预训练语言/融合模块)
+        - 新增模块 (trajectory_head, alignment, kd_proj): base_lr * 50 (2.5e-4)
         """
-        vision_lr = base_lr * 0.1   # 1e-7
-        head_lr = base_lr * 100     # 1e-4
+        vision_lr = base_lr * 0.1   # 5e-7
+        head_lr = base_lr * 50      # 2.5e-4
 
         # 分离 vision_tower 和其余 student 参数
         vision_params = list(self.student_model.vision_tower.parameters())

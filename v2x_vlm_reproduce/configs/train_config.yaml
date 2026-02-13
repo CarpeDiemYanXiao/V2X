@@ -46,17 +46,17 @@ model:
 training:
   # 基础参数 (论文明确指定)
   batch_size: 4
-  learning_rate: 1.0e-6     # 基础lr, vision=0.1x, heads=100x
+  learning_rate: 5.0e-6     # 提高基础lr, vision=0.1x, heads=50x
   weight_decay: 0.01
-  epochs: 20                # 增加到20轮 (模型在10轮时未收敛)
+  epochs: 30                # 增加到30轮 (注意力解码器需更多训练)
   
   # 学习率调度
-  warmup_epochs: 2          # warmup 2 epochs
+  warmup_epochs: 3          # warmup 3 epochs
   scheduler: "cosine"       # cosine annealing with warmup (避免linear过度衰减)
   
   # 梯度
   grad_clip: 1.0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4  # 有效batch_size = 4*4 = 16
   
   # 混合精度训练 (CUDA/NPU 均支持)
   use_amp: true             # 自动混合精度

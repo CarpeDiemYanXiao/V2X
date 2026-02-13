@@ -333,8 +333,8 @@ class Trainer:
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, vision_lr={base_lr*0.1:.1e}, backbone_lr={base_lr}, head_lr={base_lr*100:.1e}")
-        self.logger.info(f"Scheduler: {scheduler_type}, warmup={warmup_epochs}, epochs={epochs}")
+        self.logger.info(f"Optimizer: AdamW, vision_lr={base_lr*0.1:.1e}, backbone_lr={base_lr}, head_lr={base_lr*50:.1e}")
+        self.logger.info(f"Scheduler: {scheduler_type}, warmup={warmup_epochs}, epochs={epochs}, accum_steps={train_config.get('gradient_accumulation_steps', 1)}")
     
     def create_dataloaders(self):
         """创建数据加载器"""
@@ -363,22 +363,25 @@ class Trainer:
         epoch_losses = {
             'total': 0.0,
             'traj': 0.0,
+            'vel': 0.0,
             'align': 0.0,
             'kd': 0.0
         }
         num_batches = 0
         
+        # 梯度累积
+        accum_steps = self.config.get('training', {}).get('gradient_accumulation_steps', 1)
+        
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
         
-        for batch in pbar:
+        self.optimizer.zero_grad()
+        
+        for batch_idx, batch in enumerate(pbar):
             # 移动数据到设备
             pixel_values = batch['pixel_values'].to(self.device)
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            
-            # 梯度清零
-            self.optimizer.zero_grad()
             
             # 前向传播 (混合精度)
             if self.use_amp:
@@ -391,20 +394,21 @@ class Trainer:
                         trajectory_gt=trajectory_gt
                     )
                     losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
-                    loss = losses['total']
+                    loss = losses['total'] / accum_steps
                 
                 # 反向传播
                 self.scaler.scale(loss).backward()
                 
-                # 梯度裁剪
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.config.get('training', {}).get('grad_clip', 1.0)
-                )
-                
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # 梯度累积满后更新
+                if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.config.get('training', {}).get('grad_clip', 1.0)
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
             else:
                 outputs = self.model(
                     pixel_values=pixel_values,
@@ -413,25 +417,29 @@ class Trainer:
                     trajectory_gt=trajectory_gt
                 )
                 losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
-                loss = losses['total']
+                loss = losses['total'] / accum_steps
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.config.get('training', {}).get('grad_clip', 1.0)
-                )
-                self.optimizer.step()
+                
+                if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.config.get('training', {}).get('grad_clip', 1.0)
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
             
-            # 统计损失
-            epoch_losses['total'] += loss.item()
+            # 统计损失 (记录原始损失, 不含 accum_steps 缩放)
+            epoch_losses['total'] += losses['total'].item()
             epoch_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
             epoch_losses['align'] += losses.get('loss_align', torch.tensor(0.0)).item()
             epoch_losses['kd'] += losses.get('loss_kd', torch.tensor(0.0)).item()
+            epoch_losses['vel'] += losses.get('loss_vel', torch.tensor(0.0)).item()
             num_batches += 1
             
             # 更新进度条
             pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
+                'loss': f"{losses['total'].item():.4f}",
                 'traj': f"{losses.get('loss_traj', torch.tensor(0.0)).item():.4f}"
             })
             
@@ -534,6 +542,7 @@ class Trainer:
                 f"Epoch {self.current_epoch} Train - "
                 f"Total: {train_losses['total']:.4f}, "
                 f"Traj: {train_losses['traj']:.4f}, "
+                f"Vel: {train_losses.get('vel', 0):.4f}, "
                 f"Align: {train_losses['align']:.4f}, "
                 f"KD: {train_losses['kd']:.4f}"
             )

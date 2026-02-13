@@ -323,6 +323,9 @@ class V2XVLMLoss(nn.Module):
             existing_losses = model_outputs['losses']
             total = existing_losses.get('loss_traj', 0.0)
             
+            if 'loss_vel' in existing_losses:
+                total = total + existing_losses['loss_vel']
+            
             if 'loss_align' in existing_losses:
                 total = total + self.lambda_align * existing_losses['loss_align']
             
