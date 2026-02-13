@@ -321,7 +321,7 @@ class Trainer:
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, lr={base_lr} (uniform)")
+        self.logger.info(f"Optimizer: AdamW, backbone_lr={base_lr}, head_lr={base_lr*100}")
         self.logger.info(f"Scheduler: {scheduler_type}, epochs={epochs}")
     
     def create_dataloaders(self):
@@ -364,9 +364,6 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            trajectory_labels = batch.get('trajectory_labels')
-            if trajectory_labels is not None:
-                trajectory_labels = trajectory_labels.to(self.device)
             
             # 梯度清零
             self.optimizer.zero_grad()
@@ -379,8 +376,7 @@ class Trainer:
                         pixel_values=pixel_values,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        trajectory_gt=trajectory_gt,
-                        trajectory_labels=trajectory_labels
+                        trajectory_gt=trajectory_gt
                     )
                     losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                     loss = losses['total']
@@ -402,8 +398,7 @@ class Trainer:
                     pixel_values=pixel_values,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    trajectory_gt=trajectory_gt,
-                    trajectory_labels=trajectory_labels
+                    trajectory_gt=trajectory_gt
                 )
                 losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                 loss = losses['total']
@@ -455,17 +450,13 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            trajectory_labels = batch.get('trajectory_labels')
-            if trajectory_labels is not None:
-                trajectory_labels = trajectory_labels.to(self.device)
 
             # 前向传播
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                trajectory_gt=trajectory_gt,
-                trajectory_labels=trajectory_labels
+                trajectory_gt=trajectory_gt
             )
 
             losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
@@ -474,12 +465,8 @@ class Trainer:
             val_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
             num_batches += 1
 
-            # 论文 Algorithm 1 Step 5: token 生成 → 解码轨迹
-            pred_traj = self.model.generate_trajectory(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
+            # MLP 轨迹预测
+            pred_traj = outputs['trajectory_pred']
 
             # 收集预测和GT
             all_preds.append(pred_traj.cpu())
