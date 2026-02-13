@@ -120,13 +120,7 @@ class V2XVLM(nn.Module):
             cache_dir=cache_dir,
             local_files_only=True
         )
-        
-        # 冻结 student 视觉编码器 (论文 Section 5.2)
-        # "the vision encoder parameters in the student model are kept frozen"
-        print("Freezing student vision encoder (paper Section 5.2)...")
-        for param in self.student_model.vision_tower.parameters():
-            param.requires_grad = False
-        
+                
         # Teacher Model - Florence-2-Large (frozen)
         if use_knowledge_distillation:
             print("Loading Teacher model (Florence-2-Large)...")
@@ -322,7 +316,7 @@ class V2XVLM(nn.Module):
         outputs['trajectory_pred'] = trajectory_pred
 
         if trajectory_gt is not None:
-            losses['loss_traj'] = F.l1_loss(trajectory_pred, trajectory_gt)
+            losses['loss_traj'] = F.smooth_l1_loss(trajectory_pred, trajectory_gt)
 
         # ========== 2. Teacher Forward (对比对齐 + KD) ==========
         need_teacher = (self.use_kd or self.use_alignment) and self.teacher_model is not None
@@ -591,19 +585,29 @@ class V2XVLM(nn.Module):
         """
         获取可训练参数组 (不包括frozen teacher)
 
-        差分学习率:
-        - backbone (Florence-2 student): base_lr (1e-6)
-        - 新增模块 (trajectory_head, alignment, kd_proj): 100x base_lr
+        3层差分学习率:
+        - vision_tower: base_lr * 0.1 (1e-7, 预训练视觉特征需极小lr)
+        - other backbone: base_lr (1e-6, 预训练语言/融合模块)
+        - 新增模块 (trajectory_head, alignment, kd_proj): base_lr * 100 (1e-4)
         """
-        head_lr = base_lr * 100  # 1e-4
+        vision_lr = base_lr * 0.1   # 1e-7
+        head_lr = base_lr * 100     # 1e-4
+
+        # 分离 vision_tower 和其余 student 参数
+        vision_params = list(self.student_model.vision_tower.parameters())
+        vision_param_ids = set(id(p) for p in vision_params)
+        other_student_params = [p for p in self.student_model.parameters()
+                                if id(p) not in vision_param_ids]
+
         param_groups = [
-            {'params': list(self.student_model.parameters()), 'lr': base_lr},
+            {'params': vision_params, 'lr': vision_lr},
+            {'params': other_student_params, 'lr': base_lr},
             {'params': list(self.trajectory_head.parameters()), 'lr': head_lr},
         ]
 
         if self.alignment_module is not None:
             param_groups.append(
-                {'params': list(self.alignment_module.parameters()), 'lr': base_lr}
+                {'params': list(self.alignment_module.parameters()), 'lr': head_lr}
             )
 
         if self.kd_proj is not None:

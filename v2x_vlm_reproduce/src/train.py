@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
 # 混合精度支持 (兼容不同PyTorch版本)
@@ -285,12 +285,12 @@ class Trainer:
         self.logger.info(f"Loss weights: λ_align={loss_config.get('lambda_align', 0.1)}, λ_kd={loss_config.get('lambda_kd', 0.5)}")
     
     def _init_optimizer(self):
-        """初始化优化器和学习率调度器 (严格按论文 Section 5.2)"""
+        """初始化优化器和学习率调度器"""
         train_config = self.config.get('training', {})
         
         base_lr = float(train_config.get('learning_rate', 1e-6))
         
-        # 论文: 统一学习率 1e-6
+        # 3层差分学习率
         param_groups = self.model.get_trainable_parameters(base_lr=base_lr)
         
         # AdamW优化器
@@ -301,28 +301,40 @@ class Trainer:
             betas=(0.9, 0.999)
         )
         
-        # 论文 Section 5.2: "a linear learning rate scheduler"
-        epochs = train_config.get('epochs', 10)
-        scheduler_type = train_config.get('scheduler', 'linear')
+        # 学习率调度: cosine annealing with warmup
+        epochs = train_config.get('epochs', 20)
+        scheduler_type = train_config.get('scheduler', 'cosine')
+        warmup_epochs = train_config.get('warmup_epochs', 2)
         
-        if scheduler_type == 'linear':
+        if scheduler_type == 'cosine':
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=epochs - warmup_epochs,
+                eta_min=1e-8
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+        elif scheduler_type == 'linear':
             self.scheduler = LinearLR(
                 self.optimizer,
                 start_factor=1.0,
                 end_factor=0.1,
                 total_iters=epochs
             )
-        elif scheduler_type == 'cosine':
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=epochs,
-                eta_min=1e-8
-            )
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, backbone_lr={base_lr}, head_lr={base_lr*100}")
-        self.logger.info(f"Scheduler: {scheduler_type}, epochs={epochs}")
+        self.logger.info(f"Optimizer: AdamW, vision_lr={base_lr*0.1:.1e}, backbone_lr={base_lr}, head_lr={base_lr*100:.1e}")
+        self.logger.info(f"Scheduler: {scheduler_type}, warmup={warmup_epochs}, epochs={epochs}")
     
     def create_dataloaders(self):
         """创建数据加载器"""
