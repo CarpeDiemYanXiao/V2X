@@ -593,6 +593,7 @@ class V2XVLM(nn.Module):
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 num_beams=1,
+                early_stopping=False,
             )
             
             # Florence-2 是 encoder-decoder 架构
