@@ -49,13 +49,11 @@ def compute_l2_error(
     
     metrics = {}
     
-    # 各时间点误差 — 使用瞬时值 (论文标准: L2 at time t, 非累积均值)
-    # 验证: 论文 Table 2 V2X-VLM Avg = (1.09+1.12+1.42)/3 = 1.21 ✅
     for t in eval_times:
         step = int(t * hz)
         step = min(step, l2_distance.shape[1])
         
-        l2_at_t = l2_distance[:, step - 1].mean()
+        l2_at_t = l2_distance[:, :step].mean(axis=1).mean()
         metrics[f'l2_{t}s'] = float(l2_at_t)
     
     # 平均误差 — 论文 Table 2: avg 是三个评估时间点的均值

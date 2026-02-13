@@ -569,35 +569,23 @@ class Trainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 self.logger.info(f"Learning rate: {current_lr:.2e}")
             
-            # 保存检查点
+            # 仅保存最优模型
             is_best = val_losses['total'] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_losses['total']
-            
-            self.save_checkpoint(is_best=is_best, val_losses=val_losses)
+                self.save_checkpoint(val_losses=val_losses)
         
         self.logger.info(f"Training completed. Best val loss: {self.best_val_loss:.4f}")
     
-    def save_checkpoint(self, is_best: bool = False, val_losses: Dict = None):
-        """保存检查点"""
-        checkpoint_path = self.checkpoint_dir / f"epoch_{self.current_epoch}.pt"
-        
+    def save_checkpoint(self, val_losses: Dict = None):
+        """仅保存最优模型检查点"""
+        best_path = self.checkpoint_dir / "best_model.pt"
         self.model.save_checkpoint(
-            str(checkpoint_path),
+            str(best_path),
             optimizer=self.optimizer,
             epoch=self.current_epoch,
             val_losses=val_losses,
             config=self.config
-        )
-        
-        if is_best:
-            best_path = self.checkpoint_dir / "best_model.pt"
-            self.model.save_checkpoint(
-                str(best_path),
-                optimizer=self.optimizer,
-                epoch=self.current_epoch,
-                val_losses=val_losses,
-                config=self.config
             )
             self.logger.info(f"Best model saved to {best_path}")
 
