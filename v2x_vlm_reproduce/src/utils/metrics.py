@@ -105,29 +105,24 @@ def compute_collision_rate(
     hz: int = 10
 ) -> Dict[str, float]:
     """
-    计算碰撞率
+    计算碰撞率 — 论文 Table 2 定义:
+    "collision rate defined by oriented bounding-box overlap
+     between the predicted ego trajectory and surrounding obstacles"
 
-    论文 Table 2: "collision rate defined by oriented bounding-box overlap
-    between the predicted ego trajectory and surrounding obstacles"
-
-    简化为圆形碰撞检测:
-    - ego 碰撞半径 = ego 对角线 / 2
-    - obstacle 碰撞半径 = obstacle 对角线 / 2
-    - 碰撞条件: 两圆心距离 < ego_r + obs_r
-
-    注意: 障碍物位置为当前帧标注, 假设静止.
-    只在自车附近 (< 50m) 的障碍物参与碰撞检测, 远处障碍物不会真正碰撞.
+    实现要点:
+    1. 在特定评估时刻 (2.5s/3.5s/4.5s) 检测碰撞, 而非累积检测
+       (累积检测会导致 t=0 时刻附近的车辆产生大量误报)
+    2. 使用朝向边界框 (OBB): 根据 ego 行驶朝向旋转坐标系,
+       分别检查纵向 (< (L1+L2)/2) 和横向 (< (W1+W2)/2) 重叠
+    3. 障碍物为当前帧标注 (静态假设)
 
     Args:
-        pred: 预测轨迹 [B, T, 2]
-        obstacle_positions: 障碍物位置 [B, N_obs, 2] (ego-centric)
-        ego_size: 自车尺寸 (长, 宽) 米
-        obstacle_size: 障碍物尺寸 (长, 宽) 米
+        pred: 预测轨迹 [B, T, 2] (ego-centric)
+        obstacle_positions: 障碍物位置 [B, N_obs, 2] (ego-centric, 当前帧)
+        ego_size: 自车尺寸 (长, 宽)
+        obstacle_size: 障碍物尺寸 (长, 宽)
         eval_times: 评估时间点
         hz: 采样频率
-
-    Returns:
-        collision_rates: 各时间点碰撞率
     """
     if isinstance(pred, torch.Tensor):
         pred = pred.detach().cpu().numpy()
@@ -139,50 +134,51 @@ def compute_collision_rate(
 
     batch_size, num_steps, _ = pred.shape
 
-    # 碰撞判定: 用两个物体的等效圆半径之和
-    # 等效圆半径 ≈ sqrt(L^2 + W^2) / 2 (对角线的一半)
-    # 但这太大了, 实际碰撞用更紧凑的估计: (L+W)/4
-    ego_r = (ego_size[0] + ego_size[1]) / 4      # ~1.575m
-    obs_r = (obstacle_size[0] + obstacle_size[1]) / 4  # ~1.575m
-    collision_threshold = ego_r + obs_r            # ~3.15m (两车中心距)
+    ego_L, ego_W = ego_size
+    obs_L, obs_W = obstacle_size
+
+    # OBB 重叠阈值: 两物体半长/半宽之和
+    thresh_long = (ego_L + obs_L) / 2   # 纵向 (沿行驶方向) ~4.5m
+    thresh_lat  = (ego_W + obs_W) / 2   # 横向 (垂直行驶方向) ~1.8m
+
+    # 预过滤: 距原点 > 50m 的障碍物 (含 1e6 padding) 不参与检测
+    obstacle_positions = obstacle_positions.copy()
+    if obstacle_positions.ndim == 3:
+        obs_dist = np.linalg.norm(obstacle_positions, axis=-1)  # [B, N_obs]
+        obstacle_positions[obs_dist > 50.0] = 1e6
 
     metrics = {}
 
-    # 处理障碍物维度
-    if obstacle_positions.ndim == 3:
-        # [B, N_obs, 2] -> 假设障碍物静止, 广播到所有时间步
-        # 预先过滤: 只保留距离原点 50m 以内的障碍物
-        # 距离原点太远的障碍物 (包括 1e6 padding) 不可能碰撞
-        obs_dist_to_origin = np.linalg.norm(obstacle_positions, axis=-1)  # [B, N_obs]
-        far_mask = obs_dist_to_origin > 50.0  # 远处的障碍物
-        # 将远处障碍物位置设为极大值, 不会触发碰撞
-        obstacle_positions = obstacle_positions.copy()
-        obstacle_positions[far_mask] = 1e6
-
-        obstacle_positions = np.tile(
-            obstacle_positions[:, :, np.newaxis, :],
-            (1, 1, num_steps, 1)
-        )
-
     for t in eval_times:
         step = int(t * hz)
-        step = min(step, num_steps)
+        step = min(step, num_steps) - 1  # 0-indexed, 评估时刻的具体步
 
-        # 预测轨迹片段
-        pred_segment = pred[:, :step, :]  # [B, step, 2]
-        obs_segment = obstacle_positions[:, :, :step, :]  # [B, N_obs, step, 2]
+        # === Ego 在评估时刻的位置 ===
+        ego_pos = pred[:, step, :]  # [B, 2]
 
-        # 计算距离: ego 预测位置到每个障碍物的距离
-        pred_expanded = pred_segment[:, np.newaxis, :, :]  # [B, 1, step, 2]
-        distances = np.linalg.norm(pred_expanded - obs_segment, axis=-1)  # [B, N_obs, step]
+        # === Ego 在评估时刻的朝向 (从轨迹切线计算) ===
+        if step > 0:
+            dv = pred[:, step, :] - pred[:, step - 1, :]
+        else:
+            dv = pred[:, 1, :] - pred[:, 0, :]
+        heading = np.arctan2(dv[:, 1], dv[:, 0])  # [B]
+        cos_h = np.cos(-heading)  # [B]
+        sin_h = np.sin(-heading)  # [B]
 
-        # 碰撞: 任意时间步任意障碍物距离 < 阈值
-        collisions = (distances < collision_threshold).any(axis=-1).any(axis=-1)  # [B]
+        # === 障碍物相对于 ego 的位移 ===
+        dx = obstacle_positions[:, :, 0] - ego_pos[:, np.newaxis, 0]  # [B, N_obs]
+        dy = obstacle_positions[:, :, 1] - ego_pos[:, np.newaxis, 1]  # [B, N_obs]
 
-        collision_rate = float(collisions.mean())
-        metrics[f'col_{t}s'] = collision_rate
+        # === 旋转到 ego 朝向坐标系 ===
+        rel_long = dx * cos_h[:, np.newaxis] - dy * sin_h[:, np.newaxis]  # [B, N_obs]
+        rel_lat  = dx * sin_h[:, np.newaxis] + dy * cos_h[:, np.newaxis]  # [B, N_obs]
 
-    # 平均碰撞率
+        # === OBB 重叠判定: 纵向 AND 横向都在阈值内 ===
+        overlap = (np.abs(rel_long) < thresh_long) & (np.abs(rel_lat) < thresh_lat)
+        collisions = overlap.any(axis=-1)  # [B]
+
+        metrics[f'col_{t}s'] = float(collisions.mean())
+
     metrics['col_avg'] = float(np.mean([metrics[f'col_{t}s'] for t in eval_times]))
 
     return metrics
