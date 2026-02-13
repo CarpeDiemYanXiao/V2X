@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
 # 混合精度支持 (兼容不同PyTorch版本)
@@ -290,7 +290,7 @@ class Trainer:
         
         base_lr = float(train_config.get('learning_rate', 1e-6))
         
-        # 获取可训练参数组 (论文: 统一学习率 1e-6)
+        # 获取可训练参数组 (差分学习率: backbone 1e-6, heads 1e-4)
         param_groups = self.model.get_trainable_parameters(base_lr=base_lr)
         
         # AdamW优化器
@@ -301,28 +301,41 @@ class Trainer:
             betas=(0.9, 0.999)
         )
         
-        # 学习率调度器
-        scheduler_type = train_config.get('scheduler', 'linear')
-        epochs = train_config.get('epochs', 10)
+        # 学习率调度器: cosine annealing with warmup
+        scheduler_type = train_config.get('scheduler', 'cosine')
+        epochs = train_config.get('epochs', 20)
+        warmup_epochs = train_config.get('warmup_epochs', 2)
         
-        if scheduler_type == 'linear':
+        if scheduler_type == 'cosine':
+            # Warmup + Cosine: 前几个 epoch 线性升温，之后 cosine 衰减
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=epochs - warmup_epochs,
+                eta_min=1e-7
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+        elif scheduler_type == 'linear':
             self.scheduler = LinearLR(
                 self.optimizer,
                 start_factor=1.0,
                 end_factor=0.1,
                 total_iters=epochs
             )
-        elif scheduler_type == 'cosine':
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=epochs,
-                eta_min=1e-8
-            )
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, lr={base_lr}")
-        self.logger.info(f"Scheduler: {scheduler_type}")
+        self.logger.info(f"Optimizer: AdamW, base_lr={base_lr}, head_lr={base_lr*100}")
+        self.logger.info(f"Scheduler: {scheduler_type}, warmup_epochs={warmup_epochs}")
     
     def create_dataloaders(self):
         """创建数据加载器"""
@@ -364,9 +377,6 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            trajectory_labels = batch.get('trajectory_labels')
-            if trajectory_labels is not None:
-                trajectory_labels = trajectory_labels.to(self.device)
             
             # 梯度清零
             self.optimizer.zero_grad()
@@ -379,8 +389,7 @@ class Trainer:
                         pixel_values=pixel_values,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        trajectory_gt=trajectory_gt,
-                        trajectory_labels=trajectory_labels
+                        trajectory_gt=trajectory_gt
                     )
                     losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                     loss = losses['total']
@@ -402,8 +411,7 @@ class Trainer:
                     pixel_values=pixel_values,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    trajectory_gt=trajectory_gt,
-                    trajectory_labels=trajectory_labels
+                    trajectory_gt=trajectory_gt
                 )
                 losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                 loss = losses['total']
@@ -455,17 +463,13 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
-            trajectory_labels = batch.get('trajectory_labels')
-            if trajectory_labels is not None:
-                trajectory_labels = trajectory_labels.to(self.device)
 
             # 前向传播
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                trajectory_gt=trajectory_gt,
-                trajectory_labels=trajectory_labels
+                trajectory_gt=trajectory_gt
             )
 
             losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
@@ -474,12 +478,8 @@ class Trainer:
             val_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
             num_batches += 1
 
-            # 使用生成模式预测轨迹
-            pred_traj = self.model.generate_trajectory(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
+            # MLP 轨迹预测
+            pred_traj = outputs['trajectory_pred']
 
             # 收集预测和GT
             all_preds.append(pred_traj.cpu())
@@ -569,13 +569,14 @@ class Trainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 self.logger.info(f"Learning rate: {current_lr:.2e}")
             
-            # 仅保存最优模型
-            is_best = val_losses['total'] < self.best_val_loss
+            # 仅保存最优模型 (以 l2_avg 为准)
+            l2_avg = val_losses.get('l2_avg', float('inf'))
+            is_best = l2_avg < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_losses['total']
+                self.best_val_loss = l2_avg
                 self.save_checkpoint(val_losses=val_losses)
         
-        self.logger.info(f"Training completed. Best val loss: {self.best_val_loss:.4f}")
+        self.logger.info(f"Training completed. Best L2 Avg: {self.best_val_loss:.4f}m")
     
     def save_checkpoint(self, val_losses: Dict = None):
         """仅保存最优模型检查点"""
@@ -586,8 +587,8 @@ class Trainer:
             epoch=self.current_epoch,
             val_losses=val_losses,
             config=self.config
-            )
-            self.logger.info(f"Best model saved to {best_path}")
+        )
+        self.logger.info(f"Best model saved to {best_path}")
 
 
 def main():

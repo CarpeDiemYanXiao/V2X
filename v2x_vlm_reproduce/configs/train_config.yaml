@@ -46,13 +46,14 @@ model:
 training:
   # 基础参数 (论文明确指定)
   batch_size: 4
-  learning_rate: 1.0e-6     # 论文: 1e-6
+  learning_rate: 1.0e-6     # 论文: 1e-6 (backbone), heads 自动 100x
   weight_decay: 0.01
-  epochs: 10
+  epochs: 20                # 增加到20 epoch 充分收敛
   
   # 学习率调度
   warmup_steps: 100
-  scheduler: "linear"       # 线性衰减
+  warmup_epochs: 2          # warmup 前2个epoch
+  scheduler: "cosine"       # cosine annealing (比 linear 更平滑)
   
   # 梯度
   grad_clip: 1.0
