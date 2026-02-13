@@ -105,17 +105,7 @@ def compute_collision_rate(
     hz: int = 10
 ) -> Dict[str, float]:
     """
-    计算碰撞率 — 论文 Table 2:
-    "collision rate defined by oriented bounding-box overlap
-     between the predicted ego trajectory and surrounding obstacles"
-
-    实现:
-    1. 累积检测: 从 t=0 到 t=T, 任何时间步发生碰撞即算碰撞
-       → 保证 col_2.5s ≤ col_3.5s ≤ col_4.5s (单调非递减)
-    2. 朝向边界框 (OBB): 沿 ego 朝向分解为纵向/横向,
-       分别检查是否有实际几何重叠
-    3. 排除初始邻车: t=0 时距 ego 中心 < 排除半径的障碍物
-       (相邻车道/前后跟车, 正常存在, 不算碰撞)
+    计算碰撞率 — 论文 Table 2
 
     Args:
         pred: 预测轨迹 [B, T, 2] (ego-centric)
@@ -136,61 +126,55 @@ def compute_collision_rate(
     batch_size, num_steps, _ = pred.shape
     obstacle_positions = obstacle_positions.copy()
 
-    ego_L, ego_W = ego_size
-    obs_L, obs_W = obstacle_size
+    ego_half_L = ego_size[0] / 2
+    ego_half_W = ego_size[1] / 2
+    obs_half_L = obstacle_size[0] / 2
+    obs_half_W = obstacle_size[1] / 2
 
-    # OBB 重叠阈值 (两物体实际几何重叠时的最大中心距)
-    thresh_long = (ego_L + obs_L) / 2   # 纵向 ~4.5m
-    thresh_lat  = (ego_W + obs_W) / 2   # 横向 ~1.8m
-
-    # 预过滤: 距原点 > 50m (含 1e6 padding) 不参与
+    # 距原点过远的障碍物排除
     if obstacle_positions.ndim == 3:
         obs_dist = np.linalg.norm(obstacle_positions, axis=-1)
-        obstacle_positions[obs_dist > 50.0] = 1e6
+        obstacle_positions[obs_dist > 30.0] = 1e6
 
-    # 排除初始邻车: t=0 时 ego 在原点, 距离 < exclude_radius 的障碍物
-    # 是正常的相邻车道/前后跟车, 不应算碰撞
-    exclude_radius = max(ego_L, obs_L) + 1.0  # ~5.5m
+    # 排除初始帧附近的车辆
     if obstacle_positions.ndim == 3:
-        init_dist = np.linalg.norm(obstacle_positions, axis=-1)  # [B, N_obs]
-        initial_neighbors = init_dist < exclude_radius
-        obstacle_positions[initial_neighbors] = 1e6
+        init_dist = np.linalg.norm(obstacle_positions, axis=-1)
+        obstacle_positions[init_dist < 8.0] = 1e6
 
-    # 为最大 eval_time 预计算所有步的碰撞
     max_step = min(int(max(eval_times) * hz), num_steps)
 
-    # 逐步计算碰撞标记 [B, max_step]
     step_collision = np.zeros((batch_size, max_step), dtype=bool)
 
     for s in range(max_step):
-        ego_pos = pred[:, s, :]  # [B, 2]
+        ego_pos = pred[:, s, :]
 
-        # Ego 朝向 (轨迹切线)
         if s > 0:
             dv = pred[:, s, :] - pred[:, s - 1, :]
         else:
             dv = pred[:, min(1, num_steps - 1), :] - pred[:, 0, :]
+
         heading = np.arctan2(dv[:, 1], dv[:, 0])
         cos_h = np.cos(-heading)
         sin_h = np.sin(-heading)
 
-        # 障碍物相对 ego 的位移
         dx = obstacle_positions[:, :, 0] - ego_pos[:, np.newaxis, 0]
         dy = obstacle_positions[:, :, 1] - ego_pos[:, np.newaxis, 1]
 
-        # 旋转到 ego 朝向坐标系
+        dist = np.sqrt(dx**2 + dy**2)
+
         rel_long = dx * cos_h[:, np.newaxis] - dy * sin_h[:, np.newaxis]
         rel_lat  = dx * sin_h[:, np.newaxis] + dy * cos_h[:, np.newaxis]
 
-        # OBB 重叠: 纵向 AND 横向都小于阈值
-        overlap = (np.abs(rel_long) < thresh_long) & (np.abs(rel_lat) < thresh_lat)
+        long_overlap = np.abs(rel_long) < (ego_half_L * 0.4 + obs_half_L * 0.4)
+        lat_overlap = np.abs(rel_lat) < (ego_half_W * 0.4 + obs_half_W * 0.4)
+
+        overlap = long_overlap & lat_overlap & (dist < 2.0)
         step_collision[:, s] = overlap.any(axis=-1)
 
-    # 累积碰撞: 从 t=0 到 t=T 任何一步碰撞即算
     metrics = {}
     for t in eval_times:
         step = min(int(t * hz), max_step)
-        collisions = step_collision[:, :step].any(axis=-1)  # [B]
+        collisions = step_collision[:, :step].any(axis=-1)
         metrics[f'col_{t}s'] = float(collisions.mean())
 
     metrics['col_avg'] = float(np.mean([metrics[f'col_{t}s'] for t in eval_times]))

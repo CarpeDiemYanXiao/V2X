@@ -31,7 +31,7 @@ try:
 except ImportError:
     NPU_AVAILABLE = False
 
-from .trajectory_head import TrajectoryHead, TrajectoryHeadWithAttention
+from .trajectory_head import TrajectoryHead
 from .feature_alignment import FeatureAlignment
 
 
@@ -140,12 +140,10 @@ class V2XVLM(nn.Module):
         
         # 轨迹解码头
         # 论文 Section 4.2: "simple Trajectory Decoder f_traj(·) based on MLP"
-        # 升级为交叉注意力解码器, 45个可学习query分别关注多模态特征
-        self.trajectory_head = TrajectoryHeadWithAttention(
+        self.trajectory_head = TrajectoryHead(
             hidden_dim=hidden_dim,
             trajectory_length=trajectory_length,
-            num_heads=8,
-            num_layers=2,
+            mlp_hidden_dims=(512, 256, 128),
             dropout=0.1
         )
         
