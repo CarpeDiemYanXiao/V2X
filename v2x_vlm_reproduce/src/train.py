@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 
 # 混合精度支持 (兼容不同PyTorch版本)
@@ -285,57 +285,44 @@ class Trainer:
         self.logger.info(f"Loss weights: λ_align={loss_config.get('lambda_align', 0.1)}, λ_kd={loss_config.get('lambda_kd', 0.5)}")
     
     def _init_optimizer(self):
-        """初始化优化器和学习率调度器"""
+        """初始化优化器和学习率调度器 (严格按论文 Section 5.2)"""
         train_config = self.config.get('training', {})
         
         base_lr = float(train_config.get('learning_rate', 1e-6))
         
-        # 获取可训练参数组 (差分学习率: backbone 1e-6, heads 1e-4)
+        # 论文: 统一学习率 1e-6
         param_groups = self.model.get_trainable_parameters(base_lr=base_lr)
         
         # AdamW优化器
         self.optimizer = AdamW(
             param_groups,
-            lr=base_lr,                # 默认 lr (会被 param_group 覆盖)
+            lr=base_lr,
             weight_decay=float(train_config.get('weight_decay', 0.01)),
             betas=(0.9, 0.999)
         )
         
-        # 学习率调度器: cosine annealing with warmup
-        scheduler_type = train_config.get('scheduler', 'cosine')
-        epochs = train_config.get('epochs', 20)
-        warmup_epochs = train_config.get('warmup_epochs', 2)
+        # 论文 Section 5.2: "a linear learning rate scheduler"
+        epochs = train_config.get('epochs', 10)
+        scheduler_type = train_config.get('scheduler', 'linear')
         
-        if scheduler_type == 'cosine':
-            # Warmup + Cosine: 前几个 epoch 线性升温，之后 cosine 衰减
-            warmup_scheduler = LinearLR(
-                self.optimizer,
-                start_factor=0.1,
-                end_factor=1.0,
-                total_iters=warmup_epochs
-            )
-            cosine_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=epochs - warmup_epochs,
-                eta_min=1e-7
-            )
-            self.scheduler = SequentialLR(
-                self.optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs]
-            )
-        elif scheduler_type == 'linear':
+        if scheduler_type == 'linear':
             self.scheduler = LinearLR(
                 self.optimizer,
                 start_factor=1.0,
                 end_factor=0.1,
                 total_iters=epochs
             )
+        elif scheduler_type == 'cosine':
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=epochs,
+                eta_min=1e-8
+            )
         else:
             self.scheduler = None
         
-        self.logger.info(f"Optimizer: AdamW, base_lr={base_lr}, head_lr={base_lr*100}")
-        self.logger.info(f"Scheduler: {scheduler_type}, warmup_epochs={warmup_epochs}")
+        self.logger.info(f"Optimizer: AdamW, lr={base_lr} (uniform)")
+        self.logger.info(f"Scheduler: {scheduler_type}, epochs={epochs}")
     
     def create_dataloaders(self):
         """创建数据加载器"""
@@ -377,6 +364,9 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
+            trajectory_labels = batch.get('trajectory_labels')
+            if trajectory_labels is not None:
+                trajectory_labels = trajectory_labels.to(self.device)
             
             # 梯度清零
             self.optimizer.zero_grad()
@@ -389,7 +379,8 @@ class Trainer:
                         pixel_values=pixel_values,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        trajectory_gt=trajectory_gt
+                        trajectory_gt=trajectory_gt,
+                        trajectory_labels=trajectory_labels
                     )
                     losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                     loss = losses['total']
@@ -411,7 +402,8 @@ class Trainer:
                     pixel_values=pixel_values,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    trajectory_gt=trajectory_gt
+                    trajectory_gt=trajectory_gt,
+                    trajectory_labels=trajectory_labels
                 )
                 losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
                 loss = losses['total']
@@ -463,13 +455,17 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             trajectory_gt = batch['trajectory_gt'].to(self.device)
+            trajectory_labels = batch.get('trajectory_labels')
+            if trajectory_labels is not None:
+                trajectory_labels = trajectory_labels.to(self.device)
 
             # 前向传播
             outputs = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                trajectory_gt=trajectory_gt
+                trajectory_gt=trajectory_gt,
+                trajectory_labels=trajectory_labels
             )
 
             losses = self.criterion.from_model_outputs(outputs, trajectory_gt)
@@ -478,8 +474,12 @@ class Trainer:
             val_losses['traj'] += losses.get('loss_traj', torch.tensor(0.0)).item()
             num_batches += 1
 
-            # MLP 轨迹预测
-            pred_traj = outputs['trajectory_pred']
+            # 论文 Algorithm 1 Step 5: token 生成 → 解码轨迹
+            pred_traj = self.model.generate_trajectory(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
 
             # 收集预测和GT
             all_preds.append(pred_traj.cpu())

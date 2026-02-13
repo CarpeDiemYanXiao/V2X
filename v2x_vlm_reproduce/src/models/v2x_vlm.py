@@ -296,74 +296,111 @@ class V2XVLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         trajectory_gt: Optional[torch.Tensor] = None,
+        trajectory_labels: Optional[torch.Tensor] = None,
         return_features: bool = False,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
-        前向传播 — MLP 回归轨迹预测
+        前向传播 — 严格按论文实现
+
+        论文 Eq.11: L_traj = Cross-Entropy (next-token prediction)
+        论文 Eq.12: L_align = InfoNCE (student vision vs teacher text)
+        论文 Eq.13: L_KD = T^2 * KL(p_S || p_T) on token logits
 
         Args:
             pixel_values: 拼接的图像 [B, 3, H, 2W]
-            input_ids: 文本 token IDs [B, L]
+            input_ids: 文本 token IDs [B, L] (encoder input)
             attention_mask: 注意力掩码 [B, L]
-            trajectory_gt: GT 轨迹 [B, T, 2]
+            trajectory_gt: GT 轨迹 [B, T, 2] (仅用于兼容/MLP fallback)
+            trajectory_labels: 轨迹文本 token IDs [B, L_traj] (decoder target)
             return_features: 是否返回中间特征
-            
-        Returns:
-            outputs: 包含 trajectory_pred, losses 等
         """
         outputs = {}
         losses = {}
-        
-        # ========== 1. Student 多模态编码 + MLP 轨迹预测 ==========
-        student_features = self.encode_multimodal(
-            self.student_model, pixel_values, input_ids, attention_mask
-        )
-        
-        # MLP 轨迹头预测
-        trajectory_pred = self.trajectory_head(
-            student_features['fusion_features'], attention_mask=None
-        )
-        outputs['trajectory_pred'] = trajectory_pred
-        
-        # L1 轨迹损失
-        if trajectory_gt is not None:
+
+        # ========== 1. Student: Token 生成 + CE Loss (Eq.11) ==========
+        if trajectory_labels is not None:
+            student_out = self.student_model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                labels=trajectory_labels,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            losses['loss_traj'] = student_out.loss
+            outputs['student_logits'] = student_out.logits
+        elif trajectory_gt is not None:
+            # Fallback: MLP (仅当无 trajectory_labels 时)
+            student_features = self.encode_multimodal(
+                self.student_model, pixel_values, input_ids, attention_mask
+            )
+            trajectory_pred = self.trajectory_head(
+                student_features['fusion_features'], attention_mask=None
+            )
+            outputs['trajectory_pred'] = trajectory_pred
             losses['loss_traj'] = F.l1_loss(trajectory_pred, trajectory_gt)
-        
-        # ========== 2. Teacher Forward (对比对齐 + KD) ==========
+
+        # ========== 2. Student 视觉特征 (用于对比对齐) ==========
+        student_vision = None
+        if self.use_alignment and self.alignment_module is not None:
+            try:
+                if hasattr(self.student_model, '_encode_image'):
+                    student_vision = self.student_model._encode_image(pixel_values)
+                else:
+                    student_vision = self.student_model.vision_tower(pixel_values)
+                    if isinstance(student_vision, tuple):
+                        student_vision = student_vision[0]
+                    if hasattr(student_vision, 'last_hidden_state'):
+                        student_vision = student_vision.last_hidden_state
+            except Exception as e:
+                print(f"Warning: Vision feature extraction failed: {e}")
+
+        # ========== 3. Teacher Forward (对比对齐 + KD) ==========
         need_teacher = (self.use_kd or self.use_alignment) and self.teacher_model is not None
-        teacher_features = None
-        
+        teacher_text_emb = None
+
         if need_teacher:
             with torch.no_grad():
-                teacher_features = self.encode_multimodal(
-                    self.teacher_model, pixel_values, input_ids, attention_mask
-                )
-        
-        # ========== 3. 对比对齐损失 L_align (Eq.12) ==========
-        # student vision vs teacher text
+                # Teacher 文本嵌入 (用于对比对齐: Eq.12)
+                if self.use_alignment:
+                    try:
+                        teacher_encoder = self.teacher_model.language_model.model.encoder
+                        teacher_text_emb = teacher_encoder.embed_tokens(input_ids)
+                    except Exception as e:
+                        print(f"Warning: Teacher text embedding failed: {e}")
+
+                # Teacher logits (用于知识蒸馏: Eq.13)
+                if self.use_kd and trajectory_labels is not None:
+                    teacher_out = self.teacher_model(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        attention_mask=attention_mask,
+                        labels=trajectory_labels,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    outputs['teacher_logits'] = teacher_out.logits
+
+        # ========== 4. 对比对齐损失 L_align (Eq.12) ==========
         if (self.use_alignment and self.alignment_module is not None
-                and teacher_features is not None):
-            z_v, z_t = self.alignment_module(
-                student_features['vision_features'],
-                teacher_features['text_embeddings']
-            )
+                and student_vision is not None and teacher_text_emb is not None):
+            z_v, z_t = self.alignment_module(student_vision, teacher_text_emb)
             losses['loss_align'] = self.alignment_module.compute_loss(z_v, z_t)
-        
-        # ========== 4. 知识蒸馏损失 L_KD — 基于隐层特征 KL ==========
-        if (self.use_kd and teacher_features is not None):
-            losses['loss_kd'] = self.compute_kd_loss(
-                student_features['fusion_features'],
-                teacher_features['fusion_features']
+
+        # ========== 5. 知识蒸馏损失 L_KD (Eq.13) — token logits KL ==========
+        if self.use_kd and 'student_logits' in outputs and 'teacher_logits' in outputs:
+            losses['loss_kd'] = self._compute_kd_loss_logits(
+                outputs['student_logits'],
+                outputs['teacher_logits'],
+                trajectory_labels
             )
-        
+
         outputs['losses'] = losses
-        
-        if return_features:
-            outputs['student_features'] = student_features
-            if teacher_features is not None:
-                outputs['teacher_features'] = teacher_features
-        
+
+        if return_features and student_vision is not None:
+            outputs['student_vision_features'] = student_vision
+
         return outputs
     
     def compute_kd_loss(
@@ -579,56 +616,35 @@ class V2XVLM(nn.Module):
         attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        推理模式: MLP 轨迹头直接预测
-        
-        Args:
-            pixel_values: [B, 3, H, 2W]
-            input_ids: [B, L]
-            attention_mask: [B, L]
-            
-        Returns:
-            trajectory: [B, T, 2]
+        推理模式: token 生成 → 解析轨迹 (论文 Algorithm 1 Step 5)
         """
-        was_training = self.training
-        self.eval()
-        
-        with torch.no_grad():
-            student_features = self.encode_multimodal(
-                self.student_model, pixel_values, input_ids, attention_mask
-            )
-            trajectory_pred = self.trajectory_head(
-                student_features['fusion_features'], attention_mask=None
-            )
-        
-        if was_training:
-            self.train()
-        
-        return trajectory_pred
+        return self.generate_trajectory(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
     
     def get_trainable_parameters(self, base_lr: float = 1e-6) -> List[Dict]:
         """
         获取可训练参数组 (不包括frozen teacher)
 
-        差分学习率:
-        - backbone (Florence-2 student): base_lr (1e-6, 预训练参数需小lr)
-        - 新增模块 (trajectory_head, alignment, kd_proj): head_lr (100x base_lr)
-          因为这些模块是随机初始化的，需要更高学习率快速收敛
+        论文 Section 5.2: 统一学习率 1e-6
+        "Training converges in 10 epochs using the AdamW optimizer
+         with a batch size of 4, a learning rate of 1×10^{-6}"
         """
-        head_lr = base_lr * 100  # 1e-4 for randomly initialized heads
-        
         param_groups = [
             {'params': list(self.student_model.parameters()), 'lr': base_lr},
-            {'params': list(self.trajectory_head.parameters()), 'lr': head_lr},
+            {'params': list(self.trajectory_head.parameters()), 'lr': base_lr},
         ]
 
         if self.alignment_module is not None:
             param_groups.append(
-                {'params': list(self.alignment_module.parameters()), 'lr': head_lr}
+                {'params': list(self.alignment_module.parameters()), 'lr': base_lr}
             )
 
         if self.kd_proj is not None:
             param_groups.append(
-                {'params': list(self.kd_proj.parameters()), 'lr': head_lr}
+                {'params': list(self.kd_proj.parameters()), 'lr': base_lr}
             )
 
         return param_groups
