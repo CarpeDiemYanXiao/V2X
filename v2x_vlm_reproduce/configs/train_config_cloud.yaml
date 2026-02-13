@@ -21,7 +21,7 @@ training:
   batch_size: 4             # NPU/GPU 可适当增大
   learning_rate: 1.0e-6
   weight_decay: 0.01
-  epochs: 10
+  epochs: 20
   warmup_steps: 100
   scheduler: "linear"
   grad_clip: 1.0
